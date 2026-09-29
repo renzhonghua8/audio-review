@@ -221,9 +221,13 @@ async function refresh(force = false) {
 }
 const importName = entry => state.blind ? '导入音频 #' + entry.number : entry.name;
 let importRenderFrame;
+function updateImportDisplay(render = renderImports) {
+  try { render(); }
+  catch (_) { state.imports.displayError = true; }
+}
 function scheduleImportRender() {
   if (importRenderFrame) return;
-  importRenderFrame = requestAnimationFrame(() => { importRenderFrame = null; renderImports(); });
+  importRenderFrame = requestAnimationFrame(() => { importRenderFrame = null; updateImportDisplay(); });
 }
 function renderImports() {
   const imports = state.imports, entries = imports.entries;
@@ -257,7 +261,7 @@ function renderImports() {
     ? '可继续添加多条音频，已导入的音频可以先开始检测。'
     : '每条音频单独上传并确认，单条失败不会中断后续导入。';
   $('#clear-upload-history').disabled = imports.running;
-  const retryable = entries.filter(entry => entry.status === 'error' && !entry.invalid);
+  const retryable = entries.filter(entry => entry.status === 'error' && !entry.invalid && entry.file);
   $('#retry-uploads').hidden = !retryable.length;
   $('#retry-uploads').textContent = `重试未完成的音频（${retryable.length} 条）`;
   $('#upload-record-list').innerHTML = entries.map(entry => {
@@ -285,7 +289,7 @@ function sendUpload(entry) {
       scheduleImportRender();
     });
     request.upload.addEventListener('load', () => {
-      entry.progress = 1; entry.loaded = entry.size; entry.status = 'confirming'; renderImports();
+      entry.progress = 1; entry.loaded = entry.size; entry.status = 'confirming'; updateImportDisplay();
     });
     request.addEventListener('load', () => {
       const response = request.response;
@@ -306,34 +310,36 @@ function sendUpload(entry) {
 async function processUploadQueue() {
   const imports = state.imports;
   if (imports.running) return;
-  imports.running = true; renderImports();
+  imports.running = true; imports.displayError = false; updateImportDisplay();
   try {
     let entry;
     // One request at a time bounds server upload pressure and isolates each file's failure.
     while ((entry = imports.entries.find(item => item.status === 'queued'))) {
-      entry.status = 'uploading'; entry.progress = 0; entry.loaded = 0; entry.error = ''; renderImports();
+      entry.status = 'uploading'; entry.progress = 0; entry.loaded = 0; entry.error = ''; updateImportDisplay();
+      let response;
       try {
-        const response = await sendUpload(entry);
-        entry.status = 'done'; entry.progress = 1; entry.loaded = entry.size; entry.file = null;
-        // Discard a list request started before this upload was committed.
-        refreshVersion += 1;
-        for (const item of response.items) {
-          const index = state.items.findIndex(existing => existing.id === item.id);
-          if (index >= 0) state.items[index] = item; else state.items.push(item);
-          state.checked.add(item.id);
-        }
-        if (!state.selected) state.selected = response.items[0].id;
-        renderQueue(); renderDetail();
+        response = await sendUpload(entry);
       } catch (error) {
         entry.status = 'error'; entry.error = error.message || '导入未完成，请稍后重试。';
+        updateImportDisplay(); continue;
       }
-      renderImports();
+      // A rendering failure must not turn a server-confirmed upload into a retry.
+      entry.status = 'done'; entry.progress = 1; entry.loaded = entry.size; entry.file = null;
+      // Discard a list request started before this upload was committed.
+      refreshVersion += 1;
+      for (const item of response.items) {
+        const index = state.items.findIndex(existing => existing.id === item.id);
+        if (index >= 0) state.items[index] = item; else state.items.push(item);
+        state.checked.add(item.id);
+      }
+      if (!state.selected) state.selected = response.items[0].id;
+      updateImportDisplay(renderQueue); updateImportDisplay(renderDetail); updateImportDisplay();
     }
   } finally {
-    imports.running = false; renderImports(); renderQueue();
+    imports.running = false; updateImportDisplay(); updateImportDisplay(renderQueue);
     const done = imports.entries.filter(entry => entry.status === 'done').length;
     const failed = imports.entries.filter(entry => entry.status === 'error').length;
-    notify(`已导入 ${done} 条音频${failed ? '，' + failed + ' 条未完成，请查看导入明细' : '，可以批量检测'}`);
+    notify(`已导入 ${done} 条音频${failed ? '，' + failed + ' 条未完成，请查看导入明细' : '，可以批量检测'}${imports.displayError ? '。已确认的音频已保存，页面显示异常，请刷新查看。' : ''}`);
   }
 }
 function uploadFiles(files) {
@@ -349,16 +355,16 @@ function uploadFiles(files) {
     imports.entries.push({number:imports.nextId++, file, name:file.name, size:file.size, loaded:0, progress:0, status:error ? 'error' : 'queued', invalid:!!error, error});
   }
   $('#dropzone').classList.remove('dragging');
-  renderImports(); processUploadQueue();
+  updateImportDisplay(); processUploadQueue();
 }
 function retryUploads() {
   const imports = state.imports;
-  const retries = imports.entries.filter(entry => entry.status === 'error' && !entry.invalid);
+  const retries = imports.entries.filter(entry => entry.status === 'error' && !entry.invalid && entry.file);
   if (!retries.length) return;
   for (const entry of retries) { entry.status = 'queued'; entry.error = ''; entry.loaded = 0; entry.progress = 0; }
   const retried = new Set(retries);
   imports.entries = imports.entries.filter(entry => !retried.has(entry)).concat(retries);
-  renderImports(); processUploadQueue();
+  updateImportDisplay(); processUploadQueue();
 }
 async function runItems(ids, force = false) {
   if (state.loading || !ids.length) return;
