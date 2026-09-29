@@ -13,7 +13,7 @@
 
 ## CentOS Docker 部署
 
-代码仓库：[renzhonghua8/audio-review](https://github.com/renzhonghua8/audio-review)。服务器版采用 **8001** 端口，包含 Dockerfile、启动入口和持久化目录配置。完整命令见 [Docker 部署说明](Docker部署说明.md)。首次构建需要联网拉取基础镜像、系统组件与 Python 依赖；模型已经随项目提供。
+代码仓库：[renzhonghua8/audio-review](https://github.com/renzhonghua8/audio-review)。服务器版采用 **8001** 端口，可下载 GitHub 预构建镜像，不在已有服务的宿主上构建。默认独立容器、0.5 核 CPU / 1 GiB 内存、逐条批量处理；检测端口和容器名冲突，自动识别实际网卡 IP，不重启 Docker 或修改其他服务配置。完整命令及资源边界见 [Docker 部署说明](Docker部署说明.md)。模型随镜像提供。
 
 ## 已实现
 

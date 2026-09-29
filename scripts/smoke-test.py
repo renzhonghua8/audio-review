@@ -34,7 +34,8 @@ def main():
         time.sleep(1)
     else:
         raise RuntimeError('Container health check timed out')
-    assert health['evaluator_version'] == '2.0' and health['workers'] == 2
+    assert health['evaluator_version'] == '2.0'
+    assert health['workers'] == int(os.environ.get('AUDIO_REVIEW_WORKERS', '2'))
 
     audio = io.BytesIO()
     with wave.open(audio, 'wb') as output:

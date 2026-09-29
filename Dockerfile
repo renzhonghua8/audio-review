@@ -1,5 +1,8 @@
 FROM python:3.12-slim-bookworm
 
+LABEL org.opencontainers.image.source="https://github.com/renzhonghua8/audio-review" \
+    io.github.renzhonghua8.audio-review.managed="true"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

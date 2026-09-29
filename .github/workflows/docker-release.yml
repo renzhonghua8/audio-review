@@ -1,0 +1,141 @@
+name: Prebuilt Docker release
+
+on:
+  push:
+    tags: ['v*']
+  # A manual rerun must select an existing version tag, for example:
+  # gh workflow run docker-release.yml --ref v2.0.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'renzhonghua8/audio-review'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require an existing version tag
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/tags/* ]] ||
+             [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Run this workflow from an existing version tag such as v2.0.1.' >&2
+            exit 1
+          fi
+          printf 'IMAGE=audio-review:%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the tag commit and build the Linux amd64 image
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "$(git rev-parse HEAD)"
+          test "$(awk -F= '$1 == "VERSION" { print $2; exit }' scripts/deploy-docker.sh)" = "${GITHUB_REF_NAME#v}"
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE")" = amd64
+      - name: Start an existing-service test container
+        run: |
+          set -euo pipefail
+          existing_id="$(docker run -d --name audio-review-existing-service-test \
+            --init --no-healthcheck --cpus 0.05 --memory 64m --memory-swap 64m \
+            -p 127.0.0.1:9009:9009 --entrypoint python \
+            "$IMAGE" -m http.server 9009)"
+          printf 'EXISTING_SERVICE_ID=%s\n' "$existing_id" >> "$GITHUB_ENV"
+          status="$(curl --silent --show-error --retry 30 --retry-delay 1 \
+            --retry-connrefused --max-time 5 --output "$RUNNER_TEMP/existing-service-before.html" \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)"
+          test "$status" = 200
+          test "$(docker inspect --format '{{.State.Running}}' "$existing_id")" = true
+      - name: Verify a port conflict preserves both existing containers
+        run: |
+          set -euo pipefail
+          port_id="$(docker run -d --name audio-review-port-test \
+            --init --no-healthcheck --cpus 0.05 --memory 64m --memory-swap 64m \
+            -p 127.0.0.1:8001:8001 --entrypoint python \
+            "$IMAGE" -m http.server 8001)"
+          conflict_log="$RUNNER_TEMP/audio-review-port-conflict.log"
+          if sudo bash scripts/deploy-docker.sh > "$conflict_log" 2>&1; then
+            cat "$conflict_log"
+            echo 'Deployment unexpectedly succeeded with an occupied port.' >&2
+            exit 1
+          fi
+          cat "$conflict_log"
+          grep -Fq '8001 端口已被容器' "$conflict_log"
+          test "$(docker inspect --format '{{.Id}}' audio-review-port-test)" = "$port_id"
+          test "$(docker inspect --format '{{.State.Running}}' "$port_id")" = true
+          test "$(docker inspect --format '{{.Id}}' audio-review-existing-service-test)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+          docker rm -f audio-review-port-test
+      - name: Deploy using the actual automatic-IP deployment script
+        run: |
+          set -euo pipefail
+          sudo bash scripts/deploy-docker.sh
+          limits="$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' audio-review)"
+          test "$limits" = '500000000 1073741824 1073741824'
+      - name: Verify the local model, API, and preservation of the other service
+        run: |
+          set -euo pipefail
+          docker exec audio-review python scripts/smoke-test.py
+          test "$(docker inspect --format '{{.Id}}' audio-review-existing-service-test)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+      - name: Export the tested image and its checksum
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          docker save "$IMAGE" | gzip -1 > release/audio-review-linux-amd64.tar.gz
+          cd release
+          sha256sum audio-review-linux-amd64.tar.gz > audio-review-linux-amd64.tar.gz.sha256
+          sha256sum --check audio-review-linux-amd64.tar.gz.sha256
+          docker load --input audio-review-linux-amd64.tar.gz
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE")" = amd64
+          test "$(docker image inspect --format '{{index .Config.Labels "io.github.renzhonghua8.audio-review.managed"}}' "$IMAGE")" = true
+          cat > notes.md <<'NOTES'
+          声检 Linux x86_64 预构建 Docker 镜像，包含本地 DNSMOS 模型、FFmpeg 和 Python 依赖。
+
+          服务端只需下载、校验并导入镜像，不需要在已有服务的服务器上构建镜像。
+          发布前已实际执行自动识别网卡 IP 的部署脚本，验证 8001 端口冲突时保留原容器，并确认另一项模拟服务的容器 ID、运行状态和 HTTP 200 响应在部署前后保持正常。
+          在 0.5 CPU / 1 GiB 内存、单任务单模型线程的容器中检查健康接口、音频解码、音质评分、重复任务复用和人工评分独立保存；导出的包已再次校验 SHA256、导入并检查 amd64 架构和声检管理标记。
+
+          `audio-review-linux-amd64.tar.gz.sha256` 用于检查镜像包下载是否完整。
+          部署步骤请查看仓库中的 Docker部署说明.md。
+          评测算法版本仍为 2.0；合成音频仅检查执行流程，不代表预测准确性验证。
+          NOTES
+      - name: Publish only this repository's release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: renzhonghua8/audio-review
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              release/audio-review-linux-amd64.tar.gz \
+              release/audio-review-linux-amd64.tar.gz.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              release/audio-review-linux-amd64.tar.gz \
+              release/audio-review-linux-amd64.tar.gz.sha256 \
+              --verify-tag --title "声检 ${GITHUB_REF_NAME#v}" \
+              --notes-file release/notes.md
+          fi
+      - name: Show logs and remove only the three named CI test containers
+        if: always()
+        run: |
+          for container in audio-review audio-review-existing-service-test audio-review-port-test; do
+            docker logs --tail 100 "$container" || true
+            docker rm -f "$container" || true
+          done
