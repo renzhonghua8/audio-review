@@ -2,6 +2,26 @@
 
 用于中文播客的小批量音质验证。默认在本机运行，也支持用 Docker 部署到服务器。音频、自动结果和人工评分保存在运行设备，不调用外部模型或付费接口。
 
+## 技术架构与实现流程
+
+浏览器通过 FastAPI 上传音频和控制任务，服务器使用 FFmpeg 解码、ONNX Runtime 执行本地 DNSMOS 模型。评测与回听准备使用独立队列，记录和评分保存到 SQLite，原音频与兼容 MP3 保存到本地磁盘。
+
+```mermaid
+flowchart LR
+    UI["浏览器网页"] --> API["FastAPI 服务"]
+    API --> QUEUE["评测队列"]
+    QUEUE --> EVAL["FFmpeg 解码与声学检测"]
+    EVAL --> MODEL["ONNX Runtime / DNSMOS"]
+    MODEL --> DB[("SQLite 记录与评分")]
+    API <--> DB
+    API --> PLAY["回听队列 / FFmpeg 转 MP3"]
+    PLAY --> FILES[("本地音频与回听副本")]
+    FILES --> CACHE["浏览器 IndexedDB 保存"]
+    CACHE --> LISTEN["播放器回听"]
+```
+
+[技术架构与功能流程](技术架构与功能流程.md)包含模块职责、数据存储、批量导入与评测、底层评分、暂停与模式切换、回听缓存、删除、人工评分和安全升级的完整流程图，以及接口与源码位置。
+
 ## 使用
 
 1. macOS 安装 Python 3.12 或更新版本后，双击 **启动声检.command**；首次启动会安装运行组件。
