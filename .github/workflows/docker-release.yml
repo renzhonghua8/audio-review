@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
   # A manual rerun must select an existing version tag, for example:
-  # gh workflow run docker-release.yml --ref v2.0.6
+  # gh workflow run docker-release.yml --ref v2.0.7
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REF" != refs/tags/* ]] ||
              [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'Run this workflow from an existing version tag such as v2.0.6.' >&2
+            echo 'Run this workflow from an existing version tag such as v2.0.7.' >&2
             exit 1
           fi
           printf 'IMAGE=audio-review:%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -200,6 +200,7 @@ jobs:
           发布前已实际执行自动识别网卡 IP 的部署脚本，验证 8001 端口冲突时保留原容器，并确认另一项模拟服务的容器 ID、运行状态和 HTTP 200 响应在部署前后保持正常。
           默认同时评测两条不同音频，其余自动排队；模型线程为 1。网页显示真实上传进度、逐条服务器确认和失败重试，导入期间可继续追加多条音频。
           上传按真实音轨识别，支持当前 FFmpeg 能解码的本地音频及视频音轨；自动准备兼容 MP3 回听，原文件和自动评分保持不变。网页在分段读取失败时会自动切换为整文件加载，并显示真实载入进度。
+          慢网络下合并列表刷新请求，保留最后选择；回听缓存被清理后自动重建并重新加载，也能继续使用整文件备用回听。
           新增 --upgrade --stop-first：需要释放旧实例内存时，可先正常关闭仅属于声检的旧容器，再复查内存、导入镜像并启动新版；失败恢复原实例，仍保留 512 MiB 宿主余量。
           在 0.5 CPU / 1 GiB 内存、双任务单模型线程的容器中检查健康接口、音频解码、音质评分、重复任务复用和人工评分独立保存；再通过部署脚本升级至 768 MiB，确认双任务配置、原音频、自动结果和人工评分保留，并强制重新运行实际模型，另一项模拟服务继续正常运行。
           导出的包已再次校验 SHA256、导入并检查 amd64 架构和声检管理标记。

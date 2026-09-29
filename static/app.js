@@ -167,7 +167,8 @@ function setupCompatiblePlayback(item, player, generation) {
     if (phase === 'ready') {
       text = '兼容回听已就绪 · 自动评分使用原音频';
       const source = playbackBlob?.id === item.id ? playbackBlob.url : status.stream_url;
-      if (source && player.dataset.source !== source) {
+      if (source && (player.dataset.source !== source || player.error)) {
+        if (player.error && !source.startsWith('blob:')) fallbackAttempted = false;
         player.dataset.source = source;
         player.src = source; player.load();
       }
@@ -318,13 +319,17 @@ function setupPlayer(item) {
   resizeObserver = new ResizeObserver(draw); resizeObserver.observe(canvas); draw();
   setupCompatiblePlayback(item, player, generation);
 }
-let refreshVersion = 0;
-async function refresh(force = false) {
+let refreshVersion = 0, refreshFlight = null, refreshAgain = false;
+function refresh(force = false) {
+  if (refreshFlight) {
+    if (force) refreshAgain = true;
+    return refreshFlight;
+  }
   const version = ++refreshVersion, selection = state.selected;
-  try {
+  refreshFlight = (async () => { try {
     const response = await api('/api/reviews?compact=true');
     if (version !== refreshVersion) return;
-    if (selection !== state.selected) return refresh(force);
+    if (selection !== state.selected) { refreshAgain = true; return; }
     const previous = new Map(state.items.map(item => [item.id,item]));
     state.items = response.items.map(item => {
       const old = previous.get(item.id);
@@ -337,10 +342,17 @@ async function refresh(force = false) {
     if (selected?.result && eligible(selected) && !Array.isArray(selected.result.quality.windows)) {
       const item = await api('/api/reviews/' + selected.id);
       if (version !== refreshVersion) return;
+      if (selected.id !== state.selected) { refreshAgain = true; return; }
       state.items = state.items.map(row => row.id === item.id ? item : row);
     }
+    if (selected && selected.id !== state.selected) { refreshAgain = true; return; }
     renderQueue(); renderDetail(force);
   } catch (error) { if (force) notify('检测服务暂时不可用，请确认它正在运行。'); }
+  })().finally(() => {
+    refreshFlight = null;
+    if (refreshAgain) { refreshAgain = false; return refresh(true); }
+  });
+  return refreshFlight;
 }
 const importName = entry => state.blind ? '导入音频 #' + entry.number : entry.name;
 let importRenderFrame;
