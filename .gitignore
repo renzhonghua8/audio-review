@@ -1,0 +1,36 @@
+# Runtime data and local environments
+work/
+data/
+uploads/
+backups/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+
+# Audio recordings, exports and deployment archives
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.aac
+*.opus
+*.mp4
+*.aiff
+*.aif
+*.csv
+*.zip
+*.tar.gz
+.DS_Store
+.idea/
+.vscode/

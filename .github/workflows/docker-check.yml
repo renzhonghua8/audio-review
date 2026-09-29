@@ -1,0 +1,36 @@
+name: Docker build and smoke test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the deployment image
+        run: docker build -t audio-review:ci .
+      - name: Start an empty test container
+        run: >-
+          docker run -d --name audio-review-ci --init
+          -p 127.0.0.1:8001:8001 audio-review:ci
+      - name: Verify the actual local model and API
+        run: docker exec audio-review-ci python scripts/smoke-test.py
+      - name: Show logs and clean up the test container
+        if: always()
+        run: |
+          docker logs --tail 100 audio-review-ci || true
+          docker rm -f audio-review-ci || true

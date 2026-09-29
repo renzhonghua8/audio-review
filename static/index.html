@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>声检 · 音频评测</title>
+  <meta name="description" content="批量音频质检、问题片段回听与人工评分校准。">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="声检首页"><span class="brand-mark"><i></i><i></i><i></i><i></i><i></i></span><strong>声检</strong><span class="brand-sub">音频评测工作台</span></a>
+    <div class="local-label" id="runtime-label"><span class="local-icon">◉</span> 本地运行 <span class="separator">/</span> 文件留在本机</div>
+  </header>
+  <main class="workspace">
+    <div class="page-heading"><div><div class="eyebrow">AUDIO REVIEW / 小批量验证</div><h1>播客音频评测</h1><p>批量质检，定位问题，再用人工试听校准评分。</p></div><button class="button secondary" id="export-button" disabled>导出评分表</button></div>
+    <section class="summary-grid" aria-label="批次概况">
+      <div class="summary"><span>本批音频</span><div><strong id="total-count">0</strong><small>条</small></div></div>
+      <div class="summary"><span>已完成检测</span><div><strong id="done-count">0</strong><small>条</small></div></div>
+      <div class="summary"><span>有待回听问题</span><div><strong id="flagged-count">0</strong><small>条</small></div></div>
+      <div class="summary accent"><span>已完成人工评分</span><div><strong id="reviewed-count">0</strong><small>条</small></div></div>
+    </section>
+    <div class="main-grid">
+      <section class="queue-panel panel">
+        <div class="panel-heading"><div><span class="eyebrow">01 / 导入与检测</span><h2>评测队列</h2></div><button class="icon-button" id="refresh-button" title="刷新队列" aria-label="刷新队列">↻</button></div>
+        <label class="dropzone" id="dropzone" tabindex="0"><input id="file-input" type="file" accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.mp4,.aiff,.aif" multiple hidden><span class="upload-icon">＋</span><strong>拖入音频，或点击选择</strong><span>MP3 / WAV / M4A / FLAC 等 · 每批最多 20 条</span></label>
+        <div class="run-settings"><label for="scope-select">评测模式</label><select id="scope-select"><option value="fast">全量快速 · 推荐</option><option value="sample">快速抽样 · 开头与中段 2 分钟</option><option value="full">全量精细 · 1 秒滑窗</option></select><p id="scope-description">约 9 秒一个音质窗口，覆盖全段。基础声学检测始终覆盖全量。</p></div>
+        <button class="button primary full" id="run-button" disabled><span class="play-small">▶</span> 批量检测 <span id="pending-count"></span></button>
+        <p class="queue-status" id="queue-status" role="status">正在连接检测服务…</p>
+        <div class="queue-heading"><span id="queue-label">音频列表</span><label class="switch-label"><input type="checkbox" id="blind-toggle"><span>盲听模式</span></label></div>
+        <div class="batch-toolbar"><label class="switch-label"><input type="checkbox" id="select-all"><span>全选</span></label><button type="button" class="batch-link" id="select-pending">选待检测</button><button type="button" class="batch-link" id="clear-selection">清除选择</button><span id="selection-count">未选择</span></div>
+        <div class="audio-list" id="audio-list"><div class="empty-queue"><span class="mini-wave">▂ ▆ █ ▄ ▂</span><p>导入音频后，在这里查看进度。</p></div></div>
+        <div class="engine-note"><span class="engine-dot" id="engine-dot"></span><div><strong id="engine-title">正在检查本地音质模型</strong><p id="engine-description">音质检测与人工评分独立保存。</p></div></div>
+      </section>
+      <section class="detail-panel panel" id="detail-panel">
+        <div class="empty-detail"><div class="empty-illustration"><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><div class="eyebrow">02 / 结果与回听</div><h2>从一段音频开始</h2><p>导入后可查看音质评分、声音波形和问题片段。<br>人工评分沿用现有的 7 个维度。</p><div class="empty-tags"><span>真实音质检测</span><span>按时间回听</span><span>评分表导出</span></div></div>
+      </section>
+    </div>
+    <footer><span>声检 · 小批量验证版</span><span>自动音质评分用于辅助评审；主观维度需要人工校准。</span></footer>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
