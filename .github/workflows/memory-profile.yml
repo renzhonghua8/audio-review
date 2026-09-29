@@ -23,7 +23,6 @@ jobs:
       IMAGE: audio-review:2.0.2
       CONTAINER: audio-review-memory-${{ matrix.memory }}
       RELEASE_SHA256: c8d6eceee4da0ec1c914a65c95986222d0fdd9cd40ad29849103193948cdf86e
-      PROFILE_DIR: ${{ runner.temp }}/memory-profile
     defaults:
       run:
         shell: bash
@@ -31,6 +30,8 @@ jobs:
       - name: Download and verify the existing v2.0.2 Linux image
         run: |
           set -euo pipefail
+          export PROFILE_DIR="$RUNNER_TEMP/memory-profile"
+          printf 'PROFILE_DIR=%s\n' "$PROFILE_DIR" >> "$GITHUB_ENV"
           mkdir -p "$PROFILE_DIR" "$RUNNER_TEMP/released-image"
           cd "$RUNNER_TEMP/released-image"
           base=https://github.com/renzhonghua8/audio-review/releases/download/v2.0.2
