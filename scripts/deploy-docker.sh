@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.5
+VERSION=2.0.6
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -16,15 +16,19 @@ HOST_RESERVE_MB=512
 MEMORY_MB=''
 SERVER_IP=''
 UPGRADE=false
+STOP_FIRST=false
 
 fail() { echo "$*" >&2; exit 1; }
 for argument in "$@"; do
   case "$argument" in
     --upgrade) UPGRADE=true ;;
-    *) [[ -z "$SERVER_IP" ]] || fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade]'
+    --stop-first) STOP_FIRST=true ;;
+    --*) fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first]]' ;;
+    *) [[ -z "$SERVER_IP" ]] || fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first]]'
        SERVER_IP="$argument" ;;
   esac
 done
+if $STOP_FIRST && ! $UPGRADE; then fail '--stop-first 必须与 --upgrade 联用。'; fi
 [[ $(id -u) -eq 0 ]] || fail '请以 root 执行部署。'
 for required_tool in ip ss docker awk df curl sha256sum tar; do
   command -v "$required_tool" >/dev/null || fail "缺少 ${required_tool}；请先安装该工具，本脚本不会修改系统软件。"
@@ -77,7 +81,7 @@ select_memory_budget() {
   else
     MEMORY_MB="$MEMORY_REQUEST"
   fi
-  require_memory_budget
+  if ! $STOP_FIRST; then require_memory_budget; fi
   if [[ "$MEMORY_MB" -lt 1024 && ( "$WORKERS" -gt 2 || "$MODEL_THREADS" != 1 ) ]]; then
     fail '768 MiB 模式最多同时评测 2 条，且需要 AUDIO_REVIEW_MODEL_THREADS=1；请使用默认线程数。'
   fi
@@ -116,6 +120,7 @@ if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
   previous_data="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")"
   [[ "$previous_data" == "$DATA_DIR" ]] || fail "旧容器数据目录为 ${previous_data}，拒绝自动修改。"
 fi
+if $STOP_FIRST && ! $exists; then fail '--stop-first 只适用于已确认归属的现有声检容器。'; fi
 
 check_port() {
   local running bindings name owned_bindings='' listener listeners
@@ -168,6 +173,102 @@ done
 select_memory_budget
 [[ $(uname -m) == x86_64 ]] || fail '此发布镜像仅支持 Linux x86_64，部署已停止。'
 
+backup_container=''
+previous_id=''
+previous_running=false
+previous_stopped=false
+restore_pending=false
+new_container=''
+download_dir=''
+if $exists; then
+  previous_id="$(docker inspect --format '{{.Id}}' "$CONTAINER")"
+  [[ -n "$previous_id" ]] || fail '无法记录原声检容器 ID，部署已停止。'
+  previous_running="$(docker inspect --format '{{.State.Running}}' "$previous_id")"
+  [[ "$previous_running" == true || "$previous_running" == false ]] || fail '无法确认原声检运行状态，部署已停止。'
+fi
+
+restore_on_failure() {
+  local status=$? recovery_label recovery_image recovery_data recovery_id previous_name recovered=true
+  trap - EXIT HUP INT TERM
+  if [[ "$status" -ne 0 ]] && $restore_pending; then
+    if [[ -n "$new_container" ]]; then
+      docker rm -f "$new_container" >/dev/null 2>&1 || recovered=false
+    elif [[ -n "$backup_container" ]] && docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+      recovery_id="$(docker inspect --format '{{.Id}}' "$CONTAINER" 2>/dev/null)" || recovery_id=''
+      recovery_label="$(docker inspect --format "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$CONTAINER" 2>/dev/null)" || recovery_label=''
+      recovery_image="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null)" || recovery_image=''
+      recovery_data="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null)" || recovery_data=''
+      if [[ -n "$recovery_id" && "$recovery_id" != "$previous_id" && "$recovery_label" == true && "$recovery_image" == "$IMAGE" && "$recovery_data" == "$DATA_DIR" ]]; then
+        docker rm -f "$recovery_id" >/dev/null 2>&1 || recovered=false
+      fi
+    fi
+    if [[ -n "$backup_container" ]]; then
+      previous_name="$(docker inspect --format '{{.Name}}' "$previous_id" 2>/dev/null)" || previous_name=''
+      if [[ "$previous_name" != "/$CONTAINER" ]]; then
+        docker rename "$previous_id" "$CONTAINER" >/dev/null 2>&1 || recovered=false
+      fi
+    fi
+    if $previous_running; then
+      docker start "$previous_id" >/dev/null 2>&1 || recovered=false
+    fi
+    if $recovered; then
+      echo "升级失败，已恢复原声检容器（${previous_id}）；其他服务保持原状。" >&2
+    else
+      echo "升级失败，原声检自动恢复未完成；原容器 ID 为 ${previous_id}，请检查 docker ps 和日志。" >&2
+    fi
+  fi
+  [[ -z "$download_dir" ]] || rm -rf "$download_dir"
+  exit "$status"
+}
+trap restore_on_failure EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+check_previous_queue() {
+  if $previous_running && ! $previous_stopped; then
+    docker exec "$previous_id" python -c '
+import json, os, sys
+from urllib.request import build_opener, ProxyHandler
+with build_opener(ProxyHandler({})).open("http://127.0.0.1:" + os.environ.get("AUDIO_REVIEW_PORT", "8001") + "/api/reviews?compact=true", timeout=10) as response:
+    rows = json.load(response)["items"]
+if any(row["status"] in {"queued", "processing"} for row in rows):
+    sys.exit("还有音频正在检测，请等队列完成后再升级。")
+'
+  fi
+}
+
+stop_previous() {
+  $previous_stopped && return
+  [[ "$(docker inspect --format '{{.Id}}' "$CONTAINER")" == "$previous_id" ]] || fail '原声检容器已改变，拒绝继续升级。'
+  [[ "$(docker inspect --format "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$previous_id")" == true ]] || fail '原声检管理标记已改变，拒绝停止。'
+  [[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$previous_id")" == "$DATA_DIR" ]] || fail '原声检数据挂载已改变，拒绝停止。'
+  check_previous_queue
+  if $previous_running; then
+    # Arm rollback before stopping: even a failed stop may have stopped the container.
+    restore_pending=true
+    echo "记录原声检容器 ID：${previous_id}；失败时按原容器配置恢复。"
+    if $STOP_FIRST; then
+      echo '先关闭空闲的原声检以释放内存；等待正常退出，不强制结束检测。'
+      docker stop --time -1 "$previous_id"
+    else
+      docker stop --time 60 "$previous_id"
+    fi
+    previous_stopped=true
+  fi
+}
+
+if $STOP_FIRST; then
+  # Port, ownership, mount, disk and thread checks above must all pass before stopping.
+  check_previous_queue
+  if [[ "$AVAILABLE_MEMORY_KB" -lt $(((MEMORY_MB + HOST_RESERVE_MB) * 1024)) ]]; then
+    stop_previous
+    read_available_memory
+    require_memory_budget
+    echo "关闭原声检后可用内存 ${AVAILABLE_MEMORY_MB} MiB；下载与启动预算检查通过。"
+  fi
+fi
+
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   mkdir -p "$IMAGE_DIR"
   archive=audio-review-linux-amd64.tar.gz
@@ -175,18 +276,26 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo '下载 GitHub 已构建的镜像（限速 2 MB/s），不会在服务器构建。'
   download_dir="$(mktemp -d "$IMAGE_DIR/.download-XXXXXX")"
   if ! (
-    trap 'rm -rf "$download_dir"' EXIT
     curl --fail --location --retry 3 --connect-timeout 15 --limit-rate 2M "$release/$archive" -o "$download_dir/$archive" || exit 1
     curl --fail --location --retry 3 --connect-timeout 15 --limit-rate 2M "$release/$archive.sha256" -o "$download_dir/$archive.sha256" || exit 1
     cd "$download_dir" || exit 1
     sha256sum --check "$archive.sha256" || exit 1
-    docker load --input "$archive" || exit 1
   ); then
-    fail '镜像下载、校验或加载失败；没有停止任何原有服务。'
+    fail '镜像下载或校验失败，部署已停止。'
   fi
+  if $STOP_FIRST; then
+    stop_previous
+    read_available_memory
+    require_memory_budget
+  fi
+  # Image import also uses host memory; stop-first checks the full budget before import.
+  docker load --input "$download_dir/$archive" || fail '镜像加载失败，部署已停止。'
+  rm -rf "$download_dir"
+  download_dir=''
 fi
 image_managed="$(docker image inspect --format "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$IMAGE")"
 [[ "$image_managed" == true ]] || fail '同名镜像没有声检管理标记，拒绝启动。'
+if $STOP_FIRST; then stop_previous; fi
 
 # Importing an image takes time and host memory. Preserve the selected budget,
 # and recheck before changing data or stopping an owned previous instance.
@@ -196,55 +305,26 @@ echo "启动前复查：当前可用内存 ${AVAILABLE_MEMORY_MB} MiB；资源�
 
 ORIGINS="http://${SERVER_IP}:8001"
 [[ -z ${AUDIO_REVIEW_EXTRA_ORIGINS:-} ]] || ORIGINS="$ORIGINS,$AUDIO_REVIEW_EXTRA_ORIGINS"
-backup_container=''
-previous_running=false
-new_container=''
-restore_on_failure() {
-  local status=$?
-  if [[ "$status" -ne 0 && -n "$backup_container" ]]; then
-    if [[ -n "$new_container" ]]; then
-      docker rm -f "$new_container" >/dev/null 2>&1 || true
-    elif docker container inspect "$CONTAINER" >/dev/null 2>&1; then
-      recovery_label="$(docker inspect --format "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$CONTAINER" 2>/dev/null)" || recovery_label=''
-      recovery_image="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null)" || recovery_image=''
-      if [[ "$recovery_label" == true && "$recovery_image" == "$IMAGE" ]]; then
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-      fi
-    fi
-    docker rename "$backup_container" "$CONTAINER" >/dev/null 2>&1 || true
-    if $previous_running; then docker start "$CONTAINER" >/dev/null 2>&1 || true; fi
-    echo '升级失败，已尝试恢复原声检容器；请查看 docker ps 和日志。' >&2
-  fi
-}
-trap restore_on_failure EXIT
 
 mkdir -p "$DATA_DIR" "$BACKUP_DIR"
 if $exists; then
-  if [[ $(docker inspect --format '{{.State.Running}}' "$CONTAINER") == true ]]; then
-    previous_running=true
-    docker exec "$CONTAINER" python -c '
-import json, os, sys
-from urllib.request import build_opener, ProxyHandler
-with build_opener(ProxyHandler({})).open("http://127.0.0.1:" + os.environ.get("AUDIO_REVIEW_PORT", "8001") + "/api/reviews", timeout=10) as response:
-    rows = json.load(response)["items"]
-if any(row["status"] in {"queued", "processing"} for row in rows):
-    sys.exit("还有音频正在检测，请等队列完成后再升级。")
-'
-    docker stop --time 60 "$CONTAINER"
-  fi
+  stop_previous
   stamp="$(date +%Y%m%d-%H%M%S)"
   if ! tar -czf "$BACKUP_DIR/data-$stamp.tar.gz" -C "$APP_BASE" data; then
-    if $previous_running; then docker start "$CONTAINER" >/dev/null; fi
     fail '声检数据备份失败，原声检容器保留。'
   fi
-  if ! docker rename "$CONTAINER" "$CONTAINER-backup-$stamp"; then
-    if $previous_running; then docker start "$CONTAINER" >/dev/null; fi
+  backup_container="$CONTAINER-backup-$stamp"
+  restore_pending=true
+  if ! docker rename "$previous_id" "$backup_container"; then
     fail '无法为旧声检容器创建备份名称，已尝试恢复原声检。'
   fi
-  backup_container="$CONTAINER-backup-$stamp"
 fi
 
 check_port
+if $STOP_FIRST; then
+  read_available_memory
+  require_memory_budget
+fi
 chown 10001:10001 "$DATA_DIR"
 new_container="$(docker run -d \
   --name "$CONTAINER" \
@@ -270,6 +350,7 @@ sys.exit(0 if result.get("ready") and result.get("evaluator_version") == "2.0" e
 ' >/dev/null 2>&1; then
     [[ -z "$backup_container" ]] || docker rm "$backup_container" >/dev/null
     backup_container=''
+    restore_pending=false
     echo "部署完成：http://${SERVER_IP}:8001/"
     echo "资源上限：0.5 核 CPU、${MEMORY_MB} MiB 内存；不使用交换空间。"
     echo "音频和评分：${DATA_DIR}；同时评测文件数：${WORKERS}"

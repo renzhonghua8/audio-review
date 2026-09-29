@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 import csv
 from datetime import datetime, timezone
 import hashlib
@@ -8,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
 from typing import Literal
@@ -19,8 +21,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from evaluator import Evaluator, EVALUATOR_VERSION, MODEL_SHA256, SCOPE_LABELS, install_model
+from playback import PlaybackCache, PlaybackError, stream_audio
+from media import validate_audio
 
 ROOT = Path(__file__).resolve().parent
 BIND_HOST = os.environ.get('AUDIO_REVIEW_HOST', '127.0.0.1')
@@ -59,7 +64,6 @@ MODEL_THREADS = bounded_setting('AUDIO_REVIEW_MODEL_THREADS', 2)
 executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix='audio-review')
 jobs = {}
 evaluator = Evaluator(MODELS / 'sig_bak_ovr.onnx', threads=MODEL_THREADS)
-ALLOWED_SUFFIXES = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac', '.opus', '.mp4', '.aiff', '.aif'}
 MAX_FILE_BYTES = 200 * 1024 * 1024
 RATING_KEYS = ['human_likeness', 'naturalness', 'clarity', 'engagement', 'voice_distinction', 'accent_emotion']
 LABELS = ['像真人播客', '语音自然度', '音质清晰度', '愿继续听', '声音区分度', '口音情绪合适']
@@ -83,7 +87,15 @@ with connect() as database:
     database.execute("UPDATE reviews SET status='uploaded',progress=0,stage='等待重新检测',updated_at=? WHERE status IN ('queued','processing')",
                      (datetime.now(timezone.utc).isoformat(),))
 
-app = FastAPI(title='声检 · 本地音频评测', docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(application):
+    try:
+        yield
+    finally:
+        await run_in_threadpool(playback.close)
+
+
+app = FastAPI(title='声检 · 本地音频评测', docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted({urlsplit(origin).hostname for origin in ALLOWED_ORIGINS}), www_redirect=False)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 
@@ -197,6 +209,14 @@ def queue_status():
                 'queued_jobs': sum(not job['started'] for job in jobs.values())}
 
 
+def evaluation_busy():
+    queue = queue_status()
+    return bool(queue['active_jobs'] or queue['queued_jobs'])
+
+
+playback = PlaybackCache(DATA / 'playback', UPLOADS, evaluation_busy)
+
+
 @app.get('/')
 def home():
     return FileResponse(ROOT / 'static' / 'index.html')
@@ -227,15 +247,13 @@ def review_detail(identifier: str):
 async def upload(files: list[UploadFile] = File(...)):
     if not 1 <= len(files) <= 20:
         raise HTTPException(400, '每批请选择 1–20 条音频。')
-    for file in files:
-        if Path(file.filename or '').suffix.lower() not in ALLOWED_SUFFIXES:
-            raise HTTPException(400, f'不支持这个文件格式：{file.filename or "未命名文件"}')
     added, stored_paths = [], []
     try:
         for file in files:
             identifier = uuid.uuid4().hex
             filename = Path(file.filename or '音频').name[:240]
-            stored_name = identifier + Path(filename).suffix.lower()
+            suffix = Path(filename).suffix.lower()
+            stored_name = identifier + (suffix if re.fullmatch(r'\.[a-z0-9]{1,16}', suffix) else '.media')
             destination = UPLOADS / stored_name
             stored_paths.append(destination)
             size, digest = 0, hashlib.sha256()
@@ -248,6 +266,10 @@ async def upload(files: list[UploadFile] = File(...)):
                     digest.update(chunk)
             if size == 0:
                 raise HTTPException(400, f'{filename} 是空文件。')
+            try:
+                await run_in_threadpool(validate_audio, destination)
+            except RuntimeError as error:
+                raise HTTPException(400, f'{filename}：{error}') from error
             added.append((identifier, filename, stored_name, size, digest.hexdigest()))
         with db_lock, connect() as database:
             sequence = database.execute('SELECT COALESCE(MAX(sequence),0) FROM reviews').fetchone()[0]
@@ -327,13 +349,43 @@ def save_review(identifier: str, review: HumanReview):
     return public_row(get_row(identifier))
 
 
-@app.get('/api/audio/{identifier}')
-def audio(identifier: str):
+@app.api_route('/api/audio/{identifier}', methods=['GET', 'HEAD'])
+def audio(identifier: str, request: Request):
     row = get_row(identifier)
     path = UPLOADS / row['stored_name']
     if not path.is_file():
         raise HTTPException(404, '本地音频文件不存在。')
-    return FileResponse(path, content_disposition_type='inline')
+    return stream_audio(path, request)
+
+
+def playback_status(row):
+    status = playback.status(row['sha256'])
+    status['stream_url'] = f"/api/playback/{row['id']}/audio" if status['state'] == 'ready' else None
+    return status
+
+
+@app.post('/api/playback/{identifier}/prepare')
+def prepare_playback(identifier: str):
+    row = get_row(identifier)
+    result = json.loads(row['result_json']) if row['result_json'] else {}
+    duration = result.get('metrics', {}).get('duration')
+    try:
+        playback.prepare(UPLOADS / row['stored_name'], row['sha256'], duration)
+    except PlaybackError as error:
+        return JSONResponse({'state': 'error', 'progress': None, 'message': str(error),
+                             'prepared_seconds': 0, 'format': 'mp3', 'stream_url': None}, status_code=409)
+    return playback_status(row)
+
+
+@app.get('/api/playback/{identifier}/status')
+def get_playback_status(identifier: str):
+    return playback_status(get_row(identifier))
+
+
+@app.api_route('/api/playback/{identifier}/audio', methods=['GET', 'HEAD'])
+def compatible_audio(identifier: str, request: Request):
+    row = get_row(identifier)
+    return playback.audio_response(row['sha256'], request, filename=f"{row['id']}.mp3")
 
 
 def safe_cell(value):

@@ -15,6 +15,8 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 
+from media import local_input_options
+
 MODEL_URL = "https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx"
 MODEL_SHA256 = "269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd"
 SAMPLE_RATE = 16000
@@ -49,7 +51,7 @@ def install_model(destination: Path) -> Path:
 
 def decode_audio(source: Path, destination: Path, *, mono_16k: bool = False) -> None:
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
-               '-y', '-threads', '1', '-filter_threads', '1', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400']
+               '-y', '-threads', '1', '-filter_threads', '1', *local_input_options(), '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400']
     if mono_16k:
         command += ['-ac', '1', '-ar', str(SAMPLE_RATE)]
     command += ['-threads', '1', '-c:a', 'pcm_f32le', str(destination)]
@@ -68,7 +70,7 @@ def execute_decode(command: list[str]) -> None:
 def decode_pair(source: Path, original: Path, mono: Path) -> None:
     # Decode the compressed stream once, keeping the native acoustic branch.
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
-               '-y', '-threads', '1', '-filter_threads', '1', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400',
+               '-y', '-threads', '1', '-filter_threads', '1', *local_input_options(), '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400',
                '-threads', '1', '-c:a', 'pcm_f32le', str(original), '-map', '0:a:0', '-vn', '-t', '14400',
                '-ac', '1', '-ar', str(SAMPLE_RATE), '-threads', '1', '-c:a', 'pcm_f32le', str(mono)]
     execute_decode(command)

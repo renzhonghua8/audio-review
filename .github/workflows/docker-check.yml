@@ -76,6 +76,8 @@ jobs:
           PARALLEL_TEST_DISPOSABLE=1 PARALLEL_REPORT_DIR="$report_dir" \
             PARALLEL_EXISTING_SERVICE_URL=http://127.0.0.1:9009/ \
             python3 scripts/parallel-smoke-test.py | tee "$report_dir/api.log"
+          docker exec -e FORMAT_TEST_DISPOSABLE=1 audio-review-parallel-ci \
+            python scripts/media-smoke-test.py | tee "$report_dir/media-format-summary.json"
           touch "$report_dir/stop-monitor"
           wait "$monitor_pid"
           python3 scripts/container-resource-check.py verify "$report_dir" | tee "$report_dir/resources.log"

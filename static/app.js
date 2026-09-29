@@ -1,6 +1,6 @@
 'use strict';
 const $ = selector => document.querySelector(selector);
-const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, signature: '', health: null, drafts: new Map(), imports: {entries: [], running: false, nextId: 1}};
+const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, signature: '', health: null, drafts: new Map(), playbacks: new Map(), imports: {entries: [], running: false, nextId: 1}};
 const ratingFields = [
   ['human_likeness', '像真人播客吗'], ['naturalness', '语音自然度'], ['clarity', '音质清晰度'],
   ['engagement', '愿继续听'], ['voice_distinction', '声音区分度'], ['accent_emotion', '口音情绪合适'],
@@ -36,7 +36,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, options);
   if (!response.ok) {
     let message = '操作未完成，请稍后再试。';
-    try { const data = await response.json(); if (typeof data.detail === 'string') message = data.detail; } catch (_) {}
+    try { const data = await response.json(); if (typeof data.detail === 'string') message = data.detail; else if (typeof data.message === 'string') message = data.message; } catch (_) {}
     throw new Error(message);
   }
   return response.json();
@@ -73,7 +73,8 @@ function renderQueue() {
 }
 function selectedItem() { return state.items.find(item => item.id === state.selected); }
 function playerMarkup(item) {
-  return `<div class="player-box"><div class="player-tools"><audio id="audio-player" controls preload="metadata" src="/api/audio/${item.id}"></audio><label class="speed-control">倍速<select id="playback-speed" aria-label="播放倍速"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label></div><canvas id="waveform" class="waveform" aria-label="声音波形，点击可跳转播放位置" tabindex="0"></canvas><div class="wave-times"><span id="play-time">00:00</span><span>${formatTime(item.result?.metrics.duration)}</span></div></div>`;
+  const downloadName = state.blind ? item.sample_id + '-original' : item.filename;
+  return `<div class="player-box"><div class="player-tools"><audio id="audio-player" controls preload="metadata"></audio><label class="speed-control">倍速<select id="playback-speed" aria-label="播放倍速"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label></div><div class="playback-status-row"><span id="playback-status" role="status" aria-live="polite">正在准备兼容回听…</span><button type="button" id="playback-retry" class="batch-link" hidden>重试回听</button><a class="batch-link" href="/api/audio/${item.id}" download="${escapeHTML(downloadName)}">下载原音频</a></div><div class="playback-progress" id="playback-progress" hidden><span></span></div><canvas id="waveform" class="waveform" aria-label="声音波形，点击可跳转播放位置" tabindex="0"></canvas><div class="wave-times"><span id="play-time">00:00</span><span id="play-duration">${formatTime(item.result?.metrics.duration)}</span></div></div>`;
 }
 function qualityMarkup(result) {
   const quality = result.quality, metrics = result.metrics;
@@ -115,6 +116,7 @@ function renderDetail(force = false) {
     else state.drafts.delete(previousId);
   }
   const playback = previousId === item.id && previousPlayer ? {time:previousPlayer.currentTime, rate:previousPlayer.playbackRate, paused:previousPlayer.paused} : null;
+  previousPlayer?.pause();
   state.signature = signature;
   const busy = ['queued','processing'].includes(item.status);
   const meta = busy ? `${fileSize(item.size)} · ${scopeNames[item.scope]}` : item.result ? `${formatTime(item.result.metrics.duration)} · ${fileSize(item.size)} · ${resultScope(item.result.quality)}` : `${fileSize(item.size)} · ${statusNames[item.status]}`;
@@ -150,8 +152,128 @@ function renderDetail(force = false) {
     if (player.readyState >= 1) restore(); else player.addEventListener('loadedmetadata', restore, {once:true});
   }
 }
-let resizeObserver;
+let resizeObserver, playbackPollTimer, playbackGeneration = 0, playbackFetchController, playbackBlob;
+function setupCompatiblePlayback(item, player, generation) {
+  const current = () => generation === playbackGeneration && player.isConnected && state.selected === item.id;
+  let fallbackAttempted = playbackBlob?.id === item.id;
+  let fallbackLoading = false;
+  const renderStatus = status => {
+    if (!current()) return;
+    if (fallbackLoading && !['loading','error'].includes(status.state)) return;
+    const label = $('#playback-status'), progress = $('#playback-progress'), retry = $('#playback-retry');
+    if (!label || !progress || !retry) return;
+    const phase = status.state;
+    let text = status.message || '正在准备兼容回听…';
+    if (phase === 'ready') {
+      text = '兼容回听已就绪 · 自动评分使用原音频';
+      const source = playbackBlob?.id === item.id ? playbackBlob.url : status.stream_url;
+      if (source && player.dataset.source !== source) {
+        player.dataset.source = source;
+        player.src = source; player.load();
+      }
+    } else if (phase === 'converting') {
+      text = Number.isFinite(status.progress) ? `正在准备回听 ${Math.floor(status.progress)}%`
+        : `正在准备回听${Number.isFinite(status.prepared_seconds) ? ' · 已处理 ' + formatTime(status.prepared_seconds) : '…'}`;
+    }
+    label.textContent = text;
+    retry.hidden = phase !== 'error';
+    progress.hidden = !['converting','loading'].includes(phase) || !Number.isFinite(status.progress);
+    progress.firstElementChild.style.width = Math.max(0, Math.min(100, status.progress || 0)) + '%';
+  };
+  const fail = error => renderStatus({state:'error', message:error.message || '回听暂时未就绪，请重试。'});
+  const loadWithoutRanges = async () => {
+    fallbackAttempted = true; fallbackLoading = true;
+    clearTimeout(playbackPollTimer);
+    const controller = new AbortController(); playbackFetchController = controller;
+    const chunks = [];
+    try {
+      renderStatus({state:'loading', message:'正在加载兼容回听…', progress:null});
+      // A regular GET also works when a server or network drops media Range requests.
+      const response = await fetch('/api/playback/' + item.id + '/audio', {signal:controller.signal});
+      if (!response.ok || response.status !== 200) throw new Error('回听文件暂时无法读取，请重试。');
+      const limit = 512 * 1024 * 1024, total = Number(response.headers.get('Content-Length'));
+      if (total > limit) throw new Error('回听文件超过加载上限，请先拆分原音频。');
+      let loaded = 0;
+      const update = () => renderStatus({state:'loading',
+        progress:total > 0 ? Math.min(99, loaded / total * 100) : null,
+        message:`正在加载回听 · ${fileSize(loaded)}${total > 0 ? ' / ' + fileSize(total) + ' · ' + Math.min(99, Math.floor(loaded / total * 100)) + '%' : ''}`});
+      if (response.body) {
+        const reader = response.body.getReader();
+        while (true) {
+          const {done, value} = await reader.read();
+          if (done) break;
+          if (!current()) { await reader.cancel(); return; }
+          loaded += value.byteLength;
+          if (loaded > limit) { await reader.cancel(); throw new Error('回听文件超过加载上限，请先拆分原音频。'); }
+          chunks.push(value); update();
+        }
+      } else {
+        const value = await response.arrayBuffer(); loaded = value.byteLength;
+        if (loaded > limit) throw new Error('回听文件超过加载上限，请先拆分原音频。');
+        chunks.push(value);
+      }
+      if (!current()) return;
+      if (!loaded || (total > 0 && loaded !== total)) throw new Error('回听加载中断，请重试。');
+      if (playbackBlob) URL.revokeObjectURL(playbackBlob.url);
+      playbackBlob = {id:item.id, url:URL.createObjectURL(new Blob(chunks, {type:'audio/mpeg'}))};
+      fallbackLoading = false;
+      renderStatus({state:'ready', progress:100, stream_url:'/api/playback/' + item.id + '/audio'});
+    } catch (error) {
+      fallbackLoading = false;
+      if (current() && error.name !== 'AbortError') fail(error);
+    } finally {
+      chunks.length = 0;
+      if (playbackFetchController === controller) playbackFetchController = null;
+    }
+  };
+  const schedule = () => { if (current()) playbackPollTimer = setTimeout(poll, 1500); };
+  const poll = async () => {
+    if (!current()) return;
+    try {
+      const status = await api('/api/playback/' + item.id + '/status');
+      if (!current()) return;
+      state.playbacks.set(item.id, status);
+      if (status.state === 'idle') { prepare(); return; }
+      renderStatus(status);
+      if (!['ready','error'].includes(status.state)) schedule();
+    } catch (error) { if (current()) fail(error); }
+  };
+  const prepare = async () => {
+    clearTimeout(playbackPollTimer);
+    if (!current()) return;
+    renderStatus({state:'queued', message:'正在准备兼容回听…'});
+    try {
+      const status = await api('/api/playback/' + item.id + '/prepare', {method:'POST'});
+      if (!current()) return;
+      state.playbacks.set(item.id, status); renderStatus(status);
+      if (!['ready','error'].includes(status.state)) schedule();
+    } catch (error) { if (current()) fail(error); }
+  };
+  $('#playback-retry').addEventListener('click', () => {
+    playbackFetchController?.abort();
+    if (playbackBlob?.id === item.id) { URL.revokeObjectURL(playbackBlob.url); playbackBlob = null; }
+    fallbackAttempted = false; player.dataset.source = ''; prepare();
+  });
+  player.addEventListener('error', () => {
+    if (current()) {
+      if (fallbackLoading) return;
+      clearTimeout(playbackPollTimer); state.playbacks.delete(item.id);
+      if (!fallbackAttempted && player.dataset.source) { loadWithoutRanges(); return; }
+      renderStatus({state:'error', message:'兼容回听加载失败，请重试；原音频和评分已保留。'});
+    }
+  });
+  if (playbackBlob?.id === item.id) {
+    renderStatus({state:'ready', progress:100, stream_url:'/api/playback/' + item.id + '/audio'}); return;
+  }
+  const known = state.playbacks.get(item.id);
+  if (known?.state === 'ready') { renderStatus(known); poll(); }
+  else prepare();
+}
 function setupPlayer(item) {
+  const generation = ++playbackGeneration;
+  clearTimeout(playbackPollTimer);
+  playbackFetchController?.abort(); playbackFetchController = null;
+  if (playbackBlob && playbackBlob.id !== item.id) { URL.revokeObjectURL(playbackBlob.url); playbackBlob = null; }
   resizeObserver?.disconnect(); resizeObserver = null;
   const player = $('#audio-player'), canvas = $('#waveform');
   if (!player || !canvas) return;
@@ -178,10 +300,10 @@ function setupPlayer(item) {
     const position = player.currentTime / duration * width;
     ctx.fillStyle = '#183044'; ctx.fillRect(position, 3, 1.5, height - 6);
     $('#play-time').textContent = formatTime(player.currentTime);
+    $('#play-duration').textContent = formatTime(knownDuration || player.duration);
   };
   player.addEventListener('timeupdate', draw);
   player.addEventListener('loadedmetadata', draw);
-  player.addEventListener('error', () => notify('浏览器暂时无法播放这个格式，可换用 MP3 或 WAV 进行回听。'));
   $('#playback-speed').addEventListener('change', event => { player.playbackRate = Number(event.target.value); });
   canvas.addEventListener('click', event => {
     const duration = knownDuration || player.duration;
@@ -194,6 +316,7 @@ function setupPlayer(item) {
     if (event.key === ' ') { event.preventDefault(); player.paused ? player.play().catch(() => {}) : player.pause(); }
   });
   resizeObserver = new ResizeObserver(draw); resizeObserver.observe(canvas); draw();
+  setupCompatiblePlayback(item, player, generation);
 }
 let refreshVersion = 0;
 async function refresh(force = false) {
@@ -346,11 +469,8 @@ function uploadFiles(files) {
   const selected = Array.from(files); if (!selected.length) return;
   const imports = state.imports;
   if (!imports.running && imports.entries.every(entry => entry.status === 'done')) imports.entries = [];
-  const allowed = $('#file-input').accept.toLowerCase().split(',');
   for (const file of selected) {
-    const suffix = file.name.includes('.') ? '.' + file.name.split('.').pop().toLowerCase() : '';
-    const error = !allowed.includes(suffix) ? '不支持此格式，请选择 MP3、WAV、M4A、FLAC 等音频文件。'
-      : file.size > 200 * 1024 * 1024 ? '超过单条 200 MB 限制，请先拆分音频。'
+    const error = file.size > 200 * 1024 * 1024 ? '超过单条 200 MB 限制，请先拆分音频。'
       : file.size === 0 ? '文件为空，请重新选择有效音频。' : '';
     imports.entries.push({number:imports.nextId++, file, name:file.name, size:file.size, loaded:0, progress:0, status:error ? 'error' : 'queued', invalid:!!error, error});
   }
