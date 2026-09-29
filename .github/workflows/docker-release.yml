@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
   # A manual rerun must select an existing version tag, for example:
-  # gh workflow run docker-release.yml --ref v2.0.2
+  # gh workflow run docker-release.yml --ref v2.0.3
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REF" != refs/tags/* ]] ||
              [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'Run this workflow from an existing version tag such as v2.0.2.' >&2
+            echo 'Run this workflow from an existing version tag such as v2.0.3.' >&2
             exit 1
           fi
           printf 'IMAGE=audio-review:%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -97,6 +97,83 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
           test "$(curl --silent --show-error --max-time 5 --output /dev/null \
             --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+      - name: Upgrade to 768 MiB and verify saved data and fresh model execution
+        run: |
+          set -euo pipefail
+          docker exec -i audio-review python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.request import ProxyHandler, build_opener
+
+          client = build_opener(ProxyHandler({}))
+          with client.open('http://127.0.0.1:8001/api/reviews', timeout=15) as response:
+              rows = json.load(response)['items']
+          assert len(rows) == 2 and all(row['status'] == 'done' for row in rows)
+          rated = [row for row in rows if row['review']]
+          assert len(rated) == 1 and rated[0]['review']['ratings']['clarity'] == 4
+          Path('/data/ci-before-768.json').write_text(json.dumps(rows), encoding='utf-8')
+          PY
+          previous_id="$(docker inspect --format '{{.Id}}' audio-review)"
+          sudo env AUDIO_REVIEW_MEMORY_MB=768 bash scripts/deploy-docker.sh --upgrade
+          test "$(docker inspect --format '{{.Id}}' audio-review)" != "$previous_id"
+          limits="$(docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}' audio-review)"
+          test "$limits" = '500000000 805306368 805306368'
+          test "$(docker inspect --format '{{.Id}}' audio-review-existing-service-test)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+          docker exec -i audio-review python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import time
+          from urllib.request import Request, ProxyHandler, build_opener
+
+          base = 'http://127.0.0.1:8001'
+          client = build_opener(ProxyHandler({}))
+
+          def api(path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              request = Request(base + path, data=data,
+                                headers={'Content-Type': 'application/json'} if data else {})
+              with client.open(request, timeout=15) as response:
+                  return json.load(response)
+
+          snapshot_path = Path('/data/ci-before-768.json')
+          before = json.loads(snapshot_path.read_text(encoding='utf-8'))
+          assert api('/api/reviews')['items'] == before, 'Upgrade changed saved results or human ratings'
+          for row in before:
+              with client.open(base + '/api/audio/' + row['id'], timeout=15) as response:
+                  assert hashlib.sha256(response.read()).hexdigest() == row['sha256']
+          health = api('/api/health')
+          assert health['ready'] and health['evaluator_version'] == '2.0'
+          assert health['workers'] == health['model_threads'] == 1
+          target = next(row for row in before if row['review'])
+          submitted = api('/api/run', {'ids': [target['id']], 'scope': 'fast', 'force': True})
+          assert submitted['submitted'] == [target['id']] and not submitted['reused']
+          for attempt in range(120):
+              recalculated = api('/api/reviews/' + target['id'])
+              assert recalculated['status'] != 'error', recalculated
+              if recalculated['status'] == 'done':
+                  break
+              time.sleep(.5)
+          else:
+              raise RuntimeError('Fresh 768 MiB model scoring timed out')
+          assert recalculated['result']['quality'] == target['result']['quality']
+          assert not recalculated['result']['processing']['cache_hit']
+          assert recalculated['result']['processing']['elapsed_seconds'] > 0
+          assert recalculated['review'] == target['review']
+          for saved in before:
+              if saved['id'] != target['id']:
+                  assert api('/api/reviews/' + saved['id']) == saved
+          assert api('/api/health')['ready']
+          snapshot_path.unlink()
+          print('PASS: 768 MiB upgrade, unchanged audio/results/human ratings, fresh ONNX scoring, healthy API')
+          PY
+          test "$(docker inspect --format '{{.Id}}' audio-review-existing-service-test)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
       - name: Export the tested image and its checksum
         run: |
           set -euo pipefail
@@ -113,7 +190,8 @@ jobs:
 
           服务端只需下载、校验并导入镜像，不需要在已有服务的服务器上构建镜像。
           发布前已实际执行自动识别网卡 IP 的部署脚本，验证 8001 端口冲突时保留原容器，并确认另一项模拟服务的容器 ID、运行状态和 HTTP 200 响应在部署前后保持正常。
-          在 0.5 CPU / 1 GiB 内存、单任务单模型线程的容器中检查健康接口、音频解码、音质评分、重复任务复用和人工评分独立保存；导出的包已再次校验 SHA256、导入并检查 amd64 架构和声检管理标记。
+          在 0.5 CPU / 1 GiB 内存、单任务单模型线程的容器中检查健康接口、音频解码、音质评分、重复任务复用和人工评分独立保存；再通过部署脚本升级至 768 MiB，确认原音频、自动结果和人工评分保留，并强制重新运行实际模型，另一项模拟服务继续正常运行。
+          导出的包已再次校验 SHA256、导入并检查 amd64 架构和声检管理标记。
 
           `audio-review-linux-amd64.tar.gz.sha256` 用于检查镜像包下载是否完整。
           部署步骤请查看仓库中的 Docker部署说明.md。

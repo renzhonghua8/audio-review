@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.2
+VERSION=2.0.3
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -11,6 +11,9 @@ BACKUP_DIR="$APP_BASE/backups"
 IMAGE_DIR="$APP_BASE/images"
 WORKERS="${AUDIO_REVIEW_WORKERS:-1}"
 MODEL_THREADS="${AUDIO_REVIEW_MODEL_THREADS:-1}"
+MEMORY_REQUEST="${AUDIO_REVIEW_MEMORY_MB:-auto}"
+HOST_RESERVE_MB=512
+MEMORY_MB=''
 SERVER_IP=''
 UPGRADE=false
 
@@ -32,6 +35,54 @@ for value in "$WORKERS" "$MODEL_THREADS"; do
     *) fail '评测并发数和模型线程数必须在 1–8 之间。' ;;
   esac
 done
+case "$MEMORY_REQUEST" in
+  auto|768|1024) ;;
+  *) fail 'AUDIO_REVIEW_MEMORY_MB 仅支持 auto、768 或 1024（MiB）。' ;;
+esac
+
+read_available_memory() {
+  local memory_info
+  # Only use MemFree when the kernel does not expose MemAvailable; cache totals
+  # alone cannot establish how much memory can safely be reclaimed.
+  memory_info="$(awk '
+    $1 == "MemAvailable:" { available=$2; has_available=1; available_valid=($2 ~ /^[0-9]+$/ && $3 == "kB") }
+    $1 == "MemFree:" { free_value=$2; free_valid=($2 ~ /^[0-9]+$/ && $3 == "kB") }
+    END {
+      if (has_available) {
+        if (!available_valid) exit 1
+        print "MemAvailable", available
+      } else if (free_valid) {
+        print "MemFree", free_value
+      } else exit 1
+    }' /proc/meminfo 2>/dev/null)" || fail '无法可靠读取可用内存，部署已停止；请检查 /proc/meminfo。'
+  read -r MEMORY_SOURCE AVAILABLE_MEMORY_KB <<< "$memory_info"
+  [[ "$AVAILABLE_MEMORY_KB" =~ ^[0-9]+$ ]] || fail '可用内存数据无效，部署已停止。'
+  AVAILABLE_MEMORY_MB=$((AVAILABLE_MEMORY_KB / 1024))
+}
+
+require_memory_budget() {
+  local required_mb=$((MEMORY_MB + HOST_RESERVE_MB))
+  [[ "$AVAILABLE_MEMORY_KB" -ge $((required_mb * 1024)) ]] ||
+    fail "当前可用内存 ${AVAILABLE_MEMORY_MB} MiB（${MEMORY_SOURCE}）；声检上限 ${MEMORY_MB} MiB，加宿主余量 ${HOST_RESERVE_MB} MiB，共需 ${required_mb} MiB。为保护原服务，部署已停止。"
+}
+
+select_memory_budget() {
+  read_available_memory
+  if [[ "$MEMORY_REQUEST" == auto ]]; then
+    if [[ "$AVAILABLE_MEMORY_KB" -ge $(((1024 + HOST_RESERVE_MB) * 1024)) ]]; then
+      MEMORY_MB=1024
+    else
+      MEMORY_MB=768
+    fi
+  else
+    MEMORY_MB="$MEMORY_REQUEST"
+  fi
+  require_memory_budget
+  if [[ "$MEMORY_MB" -lt 1024 && ( "$WORKERS" != 1 || "$MODEL_THREADS" != 1 ) ]]; then
+    fail '768 MiB 模式需要 AUDIO_REVIEW_WORKERS=1、AUDIO_REVIEW_MODEL_THREADS=1；请使用默认线程数。'
+  fi
+  echo "当前可用内存 ${AVAILABLE_MEMORY_MB} MiB（${MEMORY_SOURCE}）；声检上限 ${MEMORY_MB} MiB；宿主余量要求 ${HOST_RESERVE_MB} MiB。"
+}
 
 if [[ -z "$SERVER_IP" ]]; then
   # Query routing without sending network traffic.
@@ -114,8 +165,7 @@ for checked_disk in "$disk_path" "$docker_disk_path"; do
   available_kb="$(df -Pk "$checked_disk" | awk 'NR==2 {print $4}')"
   [[ "$available_kb" =~ ^[0-9]+$ && "$available_kb" -ge 5242880 ]] || fail "${checked_disk} 所在磁盘可用空间不足 5 GB，部署已停止。"
 done
-available_memory="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-[[ "$available_memory" =~ ^[0-9]+$ && "$available_memory" -ge 1572864 ]] || fail '当前可用内存不足 1.5 GB，或无法确认可用内存；为保护原服务，部署已停止。'
+select_memory_budget
 [[ $(uname -m) == x86_64 ]] || fail '此发布镜像仅支持 Linux x86_64，部署已停止。'
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -137,6 +187,12 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 image_managed="$(docker image inspect --format "{{index .Config.Labels \"$MANAGED_LABEL\"}}" "$IMAGE")"
 [[ "$image_managed" == true ]] || fail '同名镜像没有声检管理标记，拒绝启动。'
+
+# Importing an image takes time and host memory. Preserve the selected budget,
+# and recheck before changing data or stopping an owned previous instance.
+read_available_memory
+require_memory_budget
+echo "启动前复查：当前可用内存 ${AVAILABLE_MEMORY_MB} MiB；资源预算检查通过。"
 
 ORIGINS="http://${SERVER_IP}:8001"
 [[ -z ${AUDIO_REVIEW_EXTRA_ORIGINS:-} ]] || ORIGINS="$ORIGINS,$AUDIO_REVIEW_EXTRA_ORIGINS"
@@ -195,7 +251,7 @@ new_container="$(docker run -d \
   --label "$MANAGED_LABEL=true" \
   --restart unless-stopped --init \
   --cpus 0.5 --cpu-shares 128 \
-  --memory 1g --memory-swap 1g --pids-limit 256 \
+  --memory "${MEMORY_MB}m" --memory-swap "${MEMORY_MB}m" --pids-limit 256 \
   -p "${SERVER_IP}:8001:8001" \
   -e "AUDIO_REVIEW_ALLOWED_ORIGINS=$ORIGINS" \
   -e "AUDIO_REVIEW_WORKERS=$WORKERS" \
@@ -215,7 +271,7 @@ sys.exit(0 if result.get("ready") and result.get("evaluator_version") == "2.0" e
     [[ -z "$backup_container" ]] || docker rm "$backup_container" >/dev/null
     backup_container=''
     echo "部署完成：http://${SERVER_IP}:8001/"
-    echo '资源上限：0.5 核 CPU、1 GB 内存；不使用交换空间。'
+    echo "资源上限：0.5 核 CPU、${MEMORY_MB} MiB 内存；不使用交换空间。"
     echo "音频和评分：${DATA_DIR}；同时评测文件数：${WORKERS}"
     exit 0
   fi
