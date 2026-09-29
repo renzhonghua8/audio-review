@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
   # A manual rerun must select an existing version tag, for example:
-  # gh workflow run docker-release.yml --ref v2.0.7
+  # gh workflow run docker-release.yml --ref v2.0.8
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REF" != refs/tags/* ]] ||
              [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'Run this workflow from an existing version tag such as v2.0.7.' >&2
+            echo 'Run this workflow from an existing version tag such as v2.0.8.' >&2
             exit 1
           fi
           printf 'IMAGE=audio-review:%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -182,6 +182,23 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
           test "$(curl --silent --show-error --max-time 5 --output /dev/null \
             --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+      - name: Verify individual and batch pause, continuation and restart persistence
+        run: |
+          set -euo pipefail
+          existing_ip="$(docker inspect --format '{{.NetworkSettings.IPAddress}}' "$EXISTING_SERVICE_ID")"
+          docker exec -e TASK_CONTROL_TEST_DISPOSABLE=1 \
+            -e TASK_CONTROL_REPORT_DIR=/tmp/task-control-ci \
+            -e TASK_CONTROL_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review python scripts/task-control-smoke-test.py
+          docker restart --time -1 audio-review
+          docker exec -e TASK_CONTROL_TEST_DISPOSABLE=1 \
+            -e TASK_CONTROL_REPORT_DIR=/tmp/task-control-ci \
+            -e TASK_CONTROL_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review python scripts/task-control-smoke-test.py --phase verify-restart
+          test "$(docker inspect --format '{{.Id}}' audio-review-existing-service-test)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
       - name: Export the tested image and its checksum
         run: |
           set -euo pipefail
@@ -199,10 +216,12 @@ jobs:
           服务端只需下载、校验并导入镜像，不需要在已有服务的服务器上构建镜像。
           发布前已实际执行自动识别网卡 IP 的部署脚本，验证 8001 端口冲突时保留原容器，并确认另一项模拟服务的容器 ID、运行状态和 HTTP 200 响应在部署前后保持正常。
           默认同时评测两条不同音频，其余自动排队；模型线程为 1。网页显示真实上传进度、逐条服务器确认和失败重试，导入期间可继续追加多条音频。
+          新增单个任务暂停/继续、勾选多条批量操作和全部暂停/继续。暂停后让出执行名额，保留已完成评分窗口；继续时重读原音频并接着剩余窗口计算。暂停状态与进度可在服务重启后保留，同内容记录可独立暂停，人工评分保留。
           上传按真实音轨识别，支持当前 FFmpeg 能解码的本地音频及视频音轨；自动准备兼容 MP3 回听，原文件和自动评分保持不变。网页在分段读取失败时会自动切换为整文件加载，并显示真实载入进度。
           慢网络下合并列表刷新请求，保留最后选择；回听缓存被清理后自动重建并重新加载，也能继续使用整文件备用回听。
           新增 --upgrade --stop-first：需要释放旧实例内存时，可先正常关闭仅属于声检的旧容器，再复查内存、导入镜像并启动新版；失败恢复原实例，仍保留 512 MiB 宿主余量。
           在 0.5 CPU / 1 GiB 内存、双任务单模型线程的容器中检查健康接口、音频解码、音质评分、重复任务复用和人工评分独立保存；再通过部署脚本升级至 768 MiB，确认双任务配置、原音频、自动结果和人工评分保留，并强制重新运行实际模型，另一项模拟服务继续正常运行。
+          在 768 MiB / 0.5 CPU 下实际执行单个/批量暂停、让出名额、重复内容独立控制、进度冻结、断点继续和隔离容器重启验证；旁边模拟服务保持运行并持续返回 HTTP 200。
           导出的包已再次校验 SHA256、导入并检查 amd64 架构和声检管理标记。
 
           `audio-review-linux-amd64.tar.gz.sha256` 用于检查镜像包下载是否完整。
@@ -226,6 +245,19 @@ jobs:
               --verify-tag --title "声检 ${GITHUB_REF_NAME#v}" \
               --notes-file release/notes.md
           fi
+      - name: Retain task-control evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/audio-review-task-control"
+          docker cp audio-review:/tmp/task-control-ci/. "$RUNNER_TEMP/audio-review-task-control/" || true
+      - name: Upload task-control verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: released-task-control
+          path: ${{ runner.temp }}/audio-review-task-control/
+          retention-days: 7
+          if-no-files-found: warn
       - name: Show logs and remove only the three named CI test containers
         if: always()
         run: |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.7
+VERSION=2.0.8
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -232,8 +232,8 @@ import json, os, sys
 from urllib.request import build_opener, ProxyHandler
 with build_opener(ProxyHandler({})).open("http://127.0.0.1:" + os.environ.get("AUDIO_REVIEW_PORT", "8001") + "/api/reviews?compact=true", timeout=10) as response:
     rows = json.load(response)["items"]
-if any(row["status"] in {"queued", "processing"} for row in rows):
-    sys.exit("还有音频正在检测，请等队列完成后再升级。")
+if any(row["status"] in {"queued", "processing", "pausing"} for row in rows):
+    sys.exit("还有音频正在检测或暂停，请等队列完成或任务完全暂停后再升级。")
 '
   fi
 }

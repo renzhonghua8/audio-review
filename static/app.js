@@ -1,11 +1,11 @@
 'use strict';
 const $ = selector => document.querySelector(selector);
-const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, signature: '', health: null, drafts: new Map(), playbacks: new Map(), imports: {entries: [], running: false, nextId: 1}};
+const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, taskControlLoading: false, signature: '', health: null, drafts: new Map(), playbacks: new Map(), imports: {entries: [], running: false, nextId: 1}};
 const ratingFields = [
   ['human_likeness', '像真人播客吗'], ['naturalness', '语音自然度'], ['clarity', '音质清晰度'],
   ['engagement', '愿继续听'], ['voice_distinction', '声音区分度'], ['accent_emotion', '口音情绪合适'],
 ];
-const statusNames = {uploaded: '等待检测', queued: '已加入队列', processing: '检测中', done: '检测完成', error: '检测失败'};
+const statusNames = {uploaded: '等待检测', queued: '已加入队列', processing: '检测中', pausing: '正在暂停', paused: '已暂停', done: '检测完成', error: '检测失败'};
 const storageLocation = () => state.health?.local_only === false ? '服务器' : '本机';
 const scopeNames = {fast: '全量快速', sample: '快速抽样', full: '全量精细'};
 const resultScope = quality => quality.scope === 'sample' && (quality.target_hop_seconds ?? quality.hop_seconds) === 1 ? '抽样精细' : scopeNames[quality.scope];
@@ -14,10 +14,14 @@ const scopeDescriptions = {
   sample: '评测开头与中段共 2 分钟，约 9 秒一个音质窗口。基础声学检测仍覆盖全量。',
   full: '按 1 秒步长密集评分，耗时较长，适合复核。基础声学检测覆盖全量。',
 };
-const eligible = item => !['queued','processing'].includes(item.status);
+const eligible = item => !['queued','processing','pausing','paused'].includes(item.status);
 const batchItems = () => {
   const checked = state.items.filter(item => state.checked.has(item.id) && eligible(item));
-  return checked.length ? checked : state.items.filter(item => ['uploaded','error'].includes(item.status));
+  return state.checked.size ? checked : state.items.filter(item => ['uploaded','error'].includes(item.status));
+};
+const taskItems = action => {
+  const items = state.checked.size ? state.items.filter(item => state.checked.has(item.id)) : state.items;
+  return items.filter(item => (action === 'pause' ? ['queued','processing'] : ['paused','pausing']).includes(item.status));
 };
 let queueSignature = '';
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -53,22 +57,31 @@ function renderQueue() {
   $('#pending-count').textContent = pending.length ? '（' + pending.length + ' 条）' : '';
   $('#export-button').disabled = !items.length;
   $('#queue-label').textContent = items.length ? '音频列表 · ' + items.length : '音频列表';
-  const selectable = items.filter(eligible), checked = selectable.filter(item => state.checked.has(item.id));
+  const selectable = items, checked = selectable.filter(item => state.checked.has(item.id));
   $('#selection-count').textContent = checked.length ? '已选 ' + checked.length + ' 条' : '未选时检测待处理音频';
   $('#select-all').checked = selectable.length > 0 && checked.length === selectable.length;
   $('#select-all').indeterminate = checked.length > 0 && checked.length < selectable.length;
   $('#select-all').disabled = !selectable.length;
+  for (const action of ['pause','resume']) {
+    const count = taskItems(action).length, button = $('#' + action + '-tasks');
+    button.disabled = state.taskControlLoading || !count || !state.health?.task_pause;
+    button.textContent = (action === 'pause' ? '暂停' : '继续') + (state.checked.size ? '所选' : '全部') + (count ? '（' + count + '）' : '');
+  }
   const queue = state.queue, workers = queue?.workers || state.health?.workers || 2;
-  $('#queue-status').textContent = queue?.active_jobs || queue?.queued_jobs
+  const paused = (queue?.paused_files ?? queue?.paused_jobs ?? 0) + (queue?.pausing_files ?? queue?.pausing_jobs ?? 0);
+  $('#queue-status').textContent = (queue?.active_jobs || queue?.queued_jobs
     ? `评测任务 ${queue.active_jobs}/${workers} · 排队 ${queue.queued_jobs} 个任务 · 可批量提交多条`
-    : `可批量提交多条 · 同时评测最多 ${workers} 条，其他自动排队`;
-  const nextQueueSignature = JSON.stringify([items.map(item => [item.id,item.updated_at]),state.selected,state.blind,[...state.checked]]);
+    : `可批量提交多条 · 同时评测最多 ${workers} 条，其他自动排队`) + (paused ? ` · 暂停 ${paused} 条` : '');
+  const nextQueueSignature = JSON.stringify([items.map(item => [item.id,item.updated_at]),state.selected,state.blind,[...state.checked],state.taskControlLoading]);
   if (nextQueueSignature === queueSignature) return;
   queueSignature = nextQueueSignature;
   $('#audio-list').innerHTML = items.length ? items.map(item => {
     const score = item.status === 'done' ? item.result?.quality.overall : null;
-    const busy = ['queued','processing'].includes(item.status);
-    return `<div class="audio-row"><label class="batch-check"><input type="checkbox" data-check="${item.id}" aria-label="选择 ${escapeHTML(displayName(item))}" ${state.checked.has(item.id) ? 'checked' : ''} ${busy ? 'disabled' : ''}></label><button class="audio-item ${item.id === state.selected ? 'selected' : ''}" data-select="${item.id}" aria-label="查看 ${escapeHTML(displayName(item))}"><span class="audio-index">${item.sample_id}</span><span class="audio-item-info"><span class="audio-name">${escapeHTML(displayName(item))}</span><span class="audio-meta"><span class="status ${escapeHTML(item.status)}">${busy ? escapeHTML(item.stage) : item.result?.processing?.cache_hit ? '已复用结果' : statusNames[item.status]}</span><span>·</span><span>${item.result ? formatTime(item.result.metrics.duration) : fileSize(item.size)}</span>${item.review.complete ? '<span>· 已评分</span>' : ''}</span>${busy ? `<span class="item-progress"><span style="width:${item.progress}%"></span></span>` : ''}</span>${score != null ? `<span class="audio-score">${scoreText(score)}</span>` : ''}</button></div>`;
+    const busy = ['queued','processing','pausing','paused'].includes(item.status);
+    const action = ['queued','processing'].includes(item.status) ? 'pause' : ['paused','pausing'].includes(item.status) ? 'resume' : null;
+    const label = action === 'pause' ? '暂停' : '继续';
+    const control = action ? `<button type="button" class="task-item-action" data-task-action="${action}" data-task-id="${item.id}" aria-label="${label} ${escapeHTML(displayName(item))}" ${state.taskControlLoading || !state.health?.task_pause ? 'disabled' : ''}>${label}</button>` : '';
+    return `<div class="audio-row"><label class="batch-check"><input type="checkbox" data-check="${item.id}" aria-label="选择 ${escapeHTML(displayName(item))}" ${state.checked.has(item.id) ? 'checked' : ''}></label><button class="audio-item ${item.id === state.selected ? 'selected' : ''}" data-select="${item.id}" aria-label="查看 ${escapeHTML(displayName(item))}"><span class="audio-index">${item.sample_id}</span><span class="audio-item-info"><span class="audio-name">${escapeHTML(displayName(item))}</span><span class="audio-meta"><span class="status ${escapeHTML(item.status)}">${busy ? escapeHTML(item.stage) : item.result?.processing?.cache_hit ? '已复用结果' : statusNames[item.status]}</span><span>·</span><span>${item.result ? formatTime(item.result.metrics.duration) : fileSize(item.size)}</span>${item.review.complete ? '<span>· 已评分</span>' : ''}</span>${busy ? `<span class="item-progress ${item.status === 'paused' ? 'paused' : ''}"><span style="width:${item.progress}%"></span></span>` : ''}</span>${score != null ? `<span class="audio-score">${scoreText(score)}</span>` : ''}</button>${control}</div>`;
   }).join('') : '<div class="empty-queue"><span class="mini-wave">▂ ▆ █ ▄ ▂</span><p>导入音频后，在这里查看进度。</p></div>';
 }
 function selectedItem() { return state.items.find(item => item.id === state.selected); }
@@ -118,19 +131,23 @@ function renderDetail(force = false) {
   const playback = previousId === item.id && previousPlayer ? {time:previousPlayer.currentTime, rate:previousPlayer.playbackRate, paused:previousPlayer.paused} : null;
   previousPlayer?.pause();
   state.signature = signature;
-  const busy = ['queued','processing'].includes(item.status);
+  const busy = ['queued','processing','pausing','paused'].includes(item.status);
+  const suspended = ['paused','pausing'].includes(item.status);
   const meta = busy ? `${fileSize(item.size)} · ${scopeNames[item.scope]}` : item.result ? `${formatTime(item.result.metrics.duration)} · ${fileSize(item.size)} · ${resultScope(item.result.quality)}` : `${fileSize(item.size)} · ${statusNames[item.status]}`;
-  const badgeClass = item.status === 'done' ? '' : item.status === 'error' ? 'amber' : 'neutral';
+  const badgeClass = item.status === 'done' ? '' : item.status === 'error' || suspended ? 'amber' : 'neutral';
   let content;
   if (item.status === 'done' && item.result) {
     content = playerMarkup(item) + qualityMarkup(item.result) + findingsMarkup(item.result) + reviewMarkup(item);
   } else if (busy) {
-    content = `<div class="notice">${escapeHTML(item.stage)}。批量任务会自动排队，在${storageLocation()}最多同时评测 ${state.health?.workers || 2} 条，可继续导入其他音频。</div><div class="job-progress"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量</p><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>正在分析声音</h3><p>完成后会显示真实音质评分和问题片段。</p></div></div>`;
+    const completed = item.task?.processed_windows || 0, total = item.task?.total_windows || 0;
+    content = `<div class="notice">${escapeHTML(item.stage)}。${suspended ? '已完成的进度保留，点击继续可恢复评测。' : `批量任务会自动排队，在${storageLocation()}最多同时评测 ${state.health?.workers || 2} 条，可继续导入其他音频。`}</div><div class="job-progress ${suspended ? 'paused' : ''}"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量${total ? `<br>已处理 ${completed} / ${total} 个评分窗口` : ''}</p><div class="task-detail-actions"><button type="button" class="button secondary" id="${suspended ? 'resume' : 'pause'}-selected" ${state.taskControlLoading || !state.health?.task_pause ? 'disabled' : ''}>${suspended ? '继续评测' : '暂停这条任务'}</button></div><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${suspended ? item.status === 'pausing' ? '正在暂停评测' : '评测已暂停' : '正在分析声音'}</h3><p>${suspended ? '原音频和人工评分保留，其他未暂停任务可继续。' : '完成后会显示真实音质评分和问题片段。'}</p></div></div>`;
   } else {
     content = playerMarkup(item) + (item.status === 'error' ? `<div class="notice error">${escapeHTML(item.error || '检测失败，请重试。')}</div>` : '<div class="notice">音频已导入。勾选多条后点击“批量检测”，系统会自动处理全部所选音频。</div>') + `<div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${item.status === 'error' ? '可以重新检测这条音频' : '准备开始检测'}</h3><button class="button secondary" id="run-selected">${item.status === 'error' ? '重试检测' : '检测这条音频'}</button></div></div>`;
   }
   $('#detail-panel').innerHTML = `<div class="detail-header"><div class="detail-title-row"><div><div class="eyebrow">02 / ${item.sample_id} · 结果与回听</div><h2>${escapeHTML(displayName(item))}</h2><div class="detail-sub">${escapeHTML(meta)}</div></div><span class="badge ${badgeClass}">${statusNames[item.status]}</span></div>${item.status === 'done' ? '<button class="text-button" id="run-selected">重新检测</button>' : ''}</div><div class="detail-body">${content}</div>`;
   $('#run-selected')?.addEventListener('click', () => runItems([item.id], item.status === 'done'));
+  $('#pause-selected')?.addEventListener('click', () => controlTasks('pause', [item.id]));
+  $('#resume-selected')?.addEventListener('click', () => controlTasks('resume', [item.id]));
   $('#review-form')?.addEventListener('submit', saveHumanReview);
   $('#detail-panel').dataset.audioId = item.id;
   const draft = state.drafts.get(item.id), form = $('#review-form');
@@ -498,6 +515,26 @@ function retryUploads() {
   imports.entries = imports.entries.filter(entry => !retried.has(entry)).concat(retries);
   updateImportDisplay(); processUploadQueue();
 }
+async function controlTasks(action, ids = taskItems(action).map(item => item.id)) {
+  if (!ids.length || state.taskControlLoading || !state.health?.task_pause) return;
+  state.taskControlLoading = true; renderQueue();
+  for (const name of ['pause','resume']) { const button = $('#' + name + '-selected'); if (button) button.disabled = true; }
+  try {
+    let changed = 0, skipped = 0;
+    for (let index = 0; index < ids.length; index += 200) {
+      const response = await api('/api/tasks/' + action, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids.slice(index,index + 200)})});
+      changed += (response[action === 'pause' ? 'paused' : 'resumed'] || []).length;
+      skipped += (response.skipped || []).length;
+      state.queue = response.queue;
+    }
+    notify(changed ? (action === 'pause' ? `已请求暂停 ${changed} 条评测` : `已继续 ${changed} 条评测`) + (skipped ? `，${skipped} 条状态已变化` : '') : '任务状态已变化，正在刷新列表');
+    await refresh(true);
+  } catch (error) { notify(error.message); await refresh(true); }
+  finally {
+    state.taskControlLoading = false; renderQueue();
+    for (const name of ['pause','resume']) { const button = $('#' + name + '-selected'); if (button) button.disabled = !state.health?.task_pause; }
+  }
+}
 async function runItems(ids, force = false) {
   if (state.loading || !ids.length) return;
   state.loading = true; renderQueue();
@@ -527,9 +564,14 @@ async function saveHumanReview(event) {
 }
 $('#blind-toggle').checked = state.blind;
 $('#blind-toggle').addEventListener('change', event => { state.blind = event.target.checked; localStorage.setItem('audio-review-blind', String(state.blind)); renderQueue(); renderDetail(true); renderImports(); });
-$('#audio-list').addEventListener('click', event => { const button = event.target.closest('[data-select]'); if (button) { state.selected = button.dataset.select; renderQueue(); refresh(true); } });
+$('#audio-list').addEventListener('click', event => {
+  const action = event.target.closest('[data-task-action]');
+  if (action) { controlTasks(action.dataset.taskAction, [action.dataset.taskId]); return; }
+  const button = event.target.closest('[data-select]');
+  if (button) { state.selected = button.dataset.select; renderQueue(); refresh(true); }
+});
 $('#audio-list').addEventListener('change', event => { const input = event.target.closest('[data-check]'); if (input) { input.checked ? state.checked.add(input.dataset.check) : state.checked.delete(input.dataset.check); renderQueue(); } });
-$('#select-all').addEventListener('change', event => { state.items.filter(eligible).forEach(item => event.target.checked ? state.checked.add(item.id) : state.checked.delete(item.id)); renderQueue(); });
+$('#select-all').addEventListener('change', event => { state.items.forEach(item => event.target.checked ? state.checked.add(item.id) : state.checked.delete(item.id)); renderQueue(); });
 $('#select-pending').addEventListener('click', () => { state.checked = new Set(state.items.filter(item => ['uploaded','error'].includes(item.status)).map(item => item.id)); renderQueue(); });
 $('#clear-selection').addEventListener('click', () => { state.checked.clear(); renderQueue(); });
 $('#scope-select').addEventListener('change', () => { $('#scope-description').textContent = scopeDescriptions[$('#scope-select').value]; });
@@ -541,6 +583,8 @@ $('#dropzone').addEventListener('drop', event => { event.preventDefault(); uploa
 $('#retry-uploads').addEventListener('click', retryUploads);
 $('#clear-upload-history').addEventListener('click', () => { if (!state.imports.running) { state.imports.entries = []; renderImports(); } });
 $('#run-button').addEventListener('click', () => runItems(batchItems().map(item => item.id)));
+$('#pause-tasks').addEventListener('click', () => controlTasks('pause'));
+$('#resume-tasks').addEventListener('click', () => controlTasks('resume'));
 $('#refresh-button').addEventListener('click', () => refresh(true));
 $('#export-button').addEventListener('click', () => { const link = document.createElement('a'); link.href = '/api/export.csv?blind=' + state.blind; link.download = '音频评测评分表.csv'; document.body.appendChild(link); link.click(); link.remove(); });
 $('#detail-panel').addEventListener('click', event => {

@@ -39,6 +39,8 @@
         </section>
         <div class="run-settings"><label for="scope-select">评测模式</label><select id="scope-select"><option value="fast">全量快速 · 推荐</option><option value="sample">快速抽样 · 开头与中段 2 分钟</option><option value="full">全量精细 · 1 秒滑窗</option></select><p id="scope-description">约 9 秒一个音质窗口，覆盖全段。基础声学检测始终覆盖全量。</p></div>
         <button class="button primary full" id="run-button" disabled><span class="play-small">▶</span> 批量检测 <span id="pending-count"></span></button>
+        <div class="task-toolbar" aria-label="评测任务控制"><button type="button" class="button secondary" id="pause-tasks" disabled>暂停全部</button><button type="button" class="button secondary" id="resume-tasks" disabled>继续全部</button></div>
+        <p class="task-control-help">勾选可暂停或继续部分任务；未勾选时操作全部。暂停后保留进度。</p>
         <p class="queue-status" id="queue-status" role="status">正在连接检测服务…</p>
         <div class="queue-heading"><span id="queue-label">音频列表</span><label class="switch-label"><input type="checkbox" id="blind-toggle"><span>盲听模式</span></label></div>
         <div class="batch-toolbar"><label class="switch-label"><input type="checkbox" id="select-all"><span>全选</span></label><button type="button" class="batch-link" id="select-pending">选待检测</button><button type="button" class="batch-link" id="clear-selection">清除选择</button><span id="selection-count">未选择</span></div>

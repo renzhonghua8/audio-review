@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
-from evaluator import Evaluator, EVALUATOR_VERSION, MODEL_SHA256, SCOPE_LABELS, install_model
+from evaluator import EvaluationPaused, Evaluator, EVALUATOR_VERSION, MODEL_SHA256, SCOPE_LABELS, install_model, read_checkpoint
 from playback import PlaybackCache, PlaybackError, stream_audio
 from media import validate_audio
 
@@ -63,6 +63,7 @@ WORKERS = bounded_setting('AUDIO_REVIEW_WORKERS', min(2, os.cpu_count() or 1))
 MODEL_THREADS = bounded_setting('AUDIO_REVIEW_MODEL_THREADS', 2)
 executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix='audio-review')
 jobs = {}
+stopping = threading.Event()
 evaluator = Evaluator(MODELS / 'sig_bak_ovr.onnx', threads=MODEL_THREADS)
 MAX_FILE_BYTES = 200 * 1024 * 1024
 RATING_KEYS = ['human_likeness', 'naturalness', 'clarity', 'engagement', 'voice_distinction', 'accent_emotion']
@@ -82,16 +83,32 @@ with connect() as database:
         size INTEGER NOT NULL, sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'uploaded', progress INTEGER NOT NULL DEFAULT 0,
         stage TEXT NOT NULL DEFAULT '等待检测', scope TEXT NOT NULL DEFAULT 'fast',
-        result_json TEXT, review_json TEXT NOT NULL DEFAULT '{}', error TEXT, updated_at TEXT NOT NULL
+        result_json TEXT, review_json TEXT NOT NULL DEFAULT '{}', error TEXT, updated_at TEXT NOT NULL,
+        task_json TEXT NOT NULL DEFAULT '{}', resume_result_json TEXT
     )''')
-    database.execute("UPDATE reviews SET status='uploaded',progress=0,stage='等待重新检测',updated_at=? WHERE status IN ('queued','processing')",
+    columns = {row[1] for row in database.execute('PRAGMA table_info(reviews)')}
+    if 'task_json' not in columns:
+        database.execute("ALTER TABLE reviews ADD COLUMN task_json TEXT NOT NULL DEFAULT '{}'")
+    if 'resume_result_json' not in columns:
+        database.execute('ALTER TABLE reviews ADD COLUMN resume_result_json TEXT')
+    database.execute("UPDATE reviews SET status='uploaded',progress=0,stage='等待重新检测',task_json='{}',resume_result_json=NULL,updated_at=? WHERE status IN ('queued','processing')",
                      (datetime.now(timezone.utc).isoformat(),))
+    database.execute("UPDATE reviews SET status='paused',stage='已暂停 · 可继续检测',updated_at=? WHERE status='pausing'",
+                     (datetime.now(timezone.utc).isoformat(),))
+
+# A paused checkpoint is compact JSON. Never retain large decoded WAVs after a
+# restart; scoring can decode the source again while retaining completed windows.
+for folder in TEMP.iterdir():
+    if folder.is_dir() and not folder.is_symlink() and re.fullmatch(r'[a-f0-9]{32}', folder.name):
+        for filename in ('decoded-original.wav', 'decoded-16k.wav', 'checkpoint.part.json'):
+            (folder / filename).unlink(missing_ok=True)
 
 @asynccontextmanager
 async def lifespan(application):
     try:
         yield
     finally:
+        await run_in_threadpool(stop_tasks)
         await run_in_threadpool(playback.close)
 
 
@@ -125,6 +142,8 @@ def public_row(row, *, compact=False):
         item['result']['quality'].pop('windows', None)
         item['result']['metrics'].pop('waveform', None)
     item['review'] = json.loads(item.pop('review_json'))
+    item['task'] = json.loads(item.pop('task_json'))
+    item.pop('resume_result_json')
     item.pop('stored_name')
     item['sample_id'] = f"S{item['sequence']:02d}"
     return item
@@ -139,7 +158,8 @@ def get_row(identifier):
 
 
 def update_many(identifiers, **values):
-    allowed = {'status', 'progress', 'stage', 'scope', 'result_json', 'review_json', 'error', 'updated_at'}
+    allowed = {'status', 'progress', 'stage', 'scope', 'result_json', 'review_json', 'error', 'updated_at',
+               'task_json', 'resume_result_json'}
     if any(key not in allowed for key in values):
         raise ValueError('Invalid update field')
     values['updated_at'] = now()
@@ -174,39 +194,191 @@ def cached_result(row, scope):
     return None
 
 
-def job_progress(key, percent, stage):
+def job_key(row, scope=None):
+    return (row['sha256'], scope or row['scope'], EVALUATOR_VERSION)
+
+
+def active_ids(job):
+    return [identifier for identifier in job['ids'] if identifier not in job['paused_ids']]
+
+
+def task_document(row):
+    return json.loads(row['task_json'])
+
+
+def task_info(job, identifier):
+    return {'session_id': job['session_id'], 'force': job['force_by_id'][identifier], **job['info']}
+
+
+def update_task_rows(job, identifiers, **values):
+    if not identifiers:
+        return
+    values['updated_at'] = now()
+    keys = [*values, 'task_json']
+    with db_lock, connect() as database:
+        database.executemany('UPDATE reviews SET ' + ','.join(f'{key}=?' for key in keys) + ' WHERE id=?',
+                             [(*values.values(), json.dumps(task_info(job, identifier)), identifier)
+                              for identifier in identifiers])
+
+
+def new_job(row, scope, force, *, restore=False):
+    task = task_document(row)
+    session_id = task.get('session_id', '') if restore else ''
+    if not re.fullmatch(r'[a-f0-9]{32}', session_id):
+        session_id = uuid.uuid4().hex
+    saved_path = TEMP / session_id / 'checkpoint.json'
+    saved = (read_checkpoint(saved_path, scope, row['sha256']) or {}) if restore else {}
+    return {'ids': [], 'paused_ids': set(), 'started': False, 'scheduled': False,
+            'pause_event': threading.Event(), 'source': UPLOADS / row['stored_name'],
+            'session_id': session_id, 'force_by_id': {},
+            'progress': row['progress'] if saved else 0,
+            'stage': '等待继续检测' if saved else '等待检测',
+            'info': {'processed_windows': saved.get('next_index', 0),
+                     'scored_windows': len(saved.get('windows', [])),
+                     'total_windows': saved.get('total_windows', 0), 'resume_count': saved.get('resume_count', 0)}}
+
+
+def create_job(row, scope, force, *, restore=False):
+    seed = row
+    if not restore:
+        with connect() as database:
+            candidates = database.execute("""SELECT * FROM reviews WHERE sha256=? AND scope=?
+                AND status IN ('paused','pausing') AND resume_result_json IS NULL ORDER BY sequence""",
+                (row['sha256'], scope)).fetchall()
+        for candidate in candidates:
+            if re.fullmatch(r'[a-f0-9]{32}', task_document(candidate).get('session_id', '')):
+                seed, restore = candidate, True
+                break
+    job = new_job(seed, scope, force, restore=restore)
+    if restore:
+        with connect() as database:
+            related = database.execute("""SELECT * FROM reviews WHERE sha256=? AND scope=?
+                AND status IN ('paused','pausing') AND resume_result_json IS NULL""",
+                (row['sha256'], scope)).fetchall()
+        for candidate in related:
+            task = task_document(candidate)
+            if task.get('session_id') == job['session_id']:
+                job['ids'].append(candidate['id'])
+                job['paused_ids'].add(candidate['id'])
+                job['force_by_id'][candidate['id']] = bool(task.get('force'))
+    return job
+
+
+def schedule_jobs():
+    # This is called under db_lock. At most WORKERS futures exist; paused jobs
+    # remain plain metadata and never occupy executor threads or child processes.
+    if stopping.is_set():
+        return
+    reserved = sum(job['scheduled'] for job in jobs.values())
+    for key, job in jobs.items():
+        if reserved >= WORKERS:
+            break
+        if not job['scheduled'] and active_ids(job):
+            job['scheduled'] = True
+            job['pause_event'].clear()
+            executor.submit(run_job, key)
+            reserved += 1
+
+
+def job_progress(key, percent, stage, info=None):
     with db_lock:
         job = jobs[key]
-        job.update(progress=percent, stage=stage)
-        update_many(job['ids'], progress=percent, stage=stage)
+        job.update(progress=max(job['progress'], percent), stage=stage)
+        if info:
+            job['info'].update(info)
+        update_task_rows(job, active_ids(job), progress=job['progress'], stage=stage)
 
 
-def run_job(key, row, scope):
+def job_checkpoint(key):
+    if stopping.is_set() or jobs[key]['pause_event'].is_set():
+        raise EvaluationPaused()
+
+
+def run_job(key):
+    with db_lock:
+        job = jobs[key]
+        if not active_ids(job) or stopping.is_set():
+            job['scheduled'] = False
+            schedule_jobs()
+            return
+        job['started'] = True
+        update_task_rows(job, active_ids(job), status='processing', stage=job['stage'],
+                         progress=job['progress'], error=None)
     try:
+        result = evaluator.evaluate(job['source'], TEMP / job['session_id'], key[1],
+                                    lambda percent, stage, info=None: job_progress(key, percent, stage, info),
+                                    checkpoint=lambda: job_checkpoint(key), source_identity=key[0])
         with db_lock:
-            job = jobs[key]
-            job.update(started=True, progress=1, stage='读取音频')
-            update_many(job['ids'], status='processing', stage='读取音频', progress=1, error=None)
-        result = evaluator.evaluate(UPLOADS / row['stored_name'], TEMP / row['id'], scope,
-                                    lambda percent, stage: job_progress(key, percent, stage))
-        with db_lock:
-            for index, identifier in enumerate(jobs[key]['ids']):
+            for index, identifier in enumerate(active_ids(job)):
                 shared = reused_result(result) if index else result
                 update(identifier, status='done', progress=100,
                        stage='检测完成 · 复用相同音频' if index else '检测完成',
-                       result_json=json.dumps(shared, ensure_ascii=False))
+                       result_json=json.dumps(shared, ensure_ascii=False), task_json='{}', resume_result_json=None)
+            # A paused duplicate does not silently complete or lose its frozen
+            # progress. Store the fresh shared result privately for explicit resume.
+            for identifier in job['paused_ids']:
+                row = get_row(identifier)
+                task = task_document(row)
+                if row['status'] == 'pausing':
+                    task.update(task_info(job, identifier))
+                update(identifier, status='paused', stage='已暂停 · 可继续检测' if row['status'] == 'pausing' else row['stage'],
+                       task_json=json.dumps(task), resume_result_json=json.dumps(reused_result(result), ensure_ascii=False))
             jobs.pop(key, None)
+    except EvaluationPaused as error:
+        with db_lock:
+            if error.info:
+                job['info'].update(error.info)
+            if error.progress is not None:
+                job['progress'] = max(job['progress'], error.progress)
+            # Keep the reservation until finally. A concurrent resume must not
+            # submit this same job while its previous worker is still exiting.
+            for identifier in job['paused_ids']:
+                if get_row(identifier)['status'] == 'pausing':
+                    update_task_rows(job, [identifier], status='paused', progress=job['progress'], stage='已暂停 · 可继续检测')
+            if stopping.is_set():
+                update_task_rows(job, active_ids(job), status='queued', progress=job['progress'], stage='服务停止 · 等待重新检测')
+            else:
+                update_task_rows(job, active_ids(job), status='queued', progress=job['progress'], stage='等待继续检测')
     except Exception as error:
         message = str(error) if isinstance(error, RuntimeError) else '检测未完成，请确认文件有效后重试。'
         with db_lock:
-            update_many(jobs[key]['ids'], status='error', stage='检测失败', progress=0, error=message)
+            update_many(active_ids(job), status='error', stage='检测失败', progress=0,
+                        error=message, task_json='{}', resume_result_json=None)
+            for identifier in job['paused_ids']:
+                task = task_document(get_row(identifier))
+                task['restart_required'] = True
+                update(identifier, status='paused', stage='已暂停 · 继续时重新检测', task_json=json.dumps(task), resume_result_json=None)
             jobs.pop(key, None)
+    finally:
+        with db_lock:
+            if jobs.get(key) is job:
+                jobs[key].update(started=False, scheduled=False)
+            schedule_jobs()
+
+
+def stop_tasks():
+    stopping.set()
+    executor.shutdown(wait=True, cancel_futures=True)
 
 
 def queue_status():
-    with db_lock:
+    with db_lock, connect() as database:
+        rows = database.execute("SELECT status,task_json,id FROM reviews WHERE status IN ('paused','pausing')").fetchall()
+        paused_sessions = set()
+        pausing_sessions = set()
+        for row in rows:
+            session_id = task_document(row).get('session_id', row['id'])
+            if row['status'] == 'pausing':
+                pausing_sessions.add(session_id)
+            else:
+                paused_sessions.add(session_id)
+        running_sessions = {job['session_id'] for job in jobs.values() if job['scheduled']}
+        paused_sessions.difference_update(running_sessions)
         return {'workers': WORKERS, 'active_jobs': sum(job['started'] for job in jobs.values()),
-                'queued_jobs': sum(not job['started'] for job in jobs.values())}
+                'queued_jobs': sum(not job['started'] and bool(active_ids(job)) for job in jobs.values()),
+                'paused_jobs': len(paused_sessions), 'pausing_jobs': len(pausing_sessions),
+                'paused_files': sum(row['status'] == 'paused' for row in rows),
+                'pausing_files': sum(row['status'] == 'pausing' for row in rows)}
 
 
 def evaluation_busy():
@@ -227,7 +399,7 @@ def health():
     return {'ready': evaluator.ready, 'model': 'DNSMOS P.835 · regular', 'model_sha256': MODEL_SHA256,
             'subjective_model': None, 'local_only': IS_LOCAL, 'max_file_mb': 200, 'max_batch_files': 20,
             'max_run_files': 200, 'workers': WORKERS, 'model_threads': MODEL_THREADS,
-            'evaluator_version': EVALUATOR_VERSION, 'scopes': SCOPE_LABELS}
+            'evaluator_version': EVALUATOR_VERSION, 'scopes': SCOPE_LABELS, 'task_pause': True}
 
 
 @app.get('/api/reviews')
@@ -299,30 +471,103 @@ def run(request: RunRequest):
     if not evaluator.ready:
         raise HTTPException(503, '本地音质模型未就绪，请先运行模型安装。')
     rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
-    submitted, reused = [], []
+    submitted, reused, skipped = [], [], []
     with db_lock:
         for row in rows:
             fresh = get_row(row['id'])
-            if fresh['status'] in {'queued', 'processing'}:
+            if fresh['status'] in {'queued', 'processing', 'paused', 'pausing'}:
+                skipped.append(row['id'])
                 continue
             result = None if request.force else cached_result(fresh, request.scope)
             if result:
                 update(row['id'], status='done', progress=100, stage='检测完成 · 复用相同音频',
-                       scope=request.scope, error=None, result_json=json.dumps(result, ensure_ascii=False))
+                       scope=request.scope, error=None, result_json=json.dumps(result, ensure_ascii=False),
+                       task_json='{}', resume_result_json=None)
                 reused.append(row['id'])
             else:
-                key = (row['sha256'], request.scope, EVALUATOR_VERSION)
+                key = job_key(row, request.scope)
                 existing = jobs.get(key)
-                update(row['id'], status='processing' if existing and existing['started'] else 'queued',
-                       progress=existing['progress'] if existing else 0,
-                       stage=existing['stage'] if existing else '等待检测', scope=request.scope, error=None)
-                if existing:
-                    existing['ids'].append(row['id'])
-                else:
-                    jobs[key] = {'ids': [row['id']], 'started': False, 'progress': 0, 'stage': '等待检测'}
-                    executor.submit(run_job, key, row, request.scope)
+                if existing is None:
+                    existing = jobs[key] = create_job(fresh, request.scope, request.force)
+                existing['ids'].append(row['id'])
+                existing['force_by_id'][row['id']] = request.force
+                existing['pause_event'].clear()
+                update_task_rows(existing, [row['id']], status='processing' if existing['started'] else 'queued',
+                                 progress=existing['progress'], stage=existing['stage'], scope=request.scope,
+                                 error=None, resume_result_json=None)
             submitted.append(row['id'])
-    return {'submitted': submitted, 'reused': reused, 'queue': queue_status()}
+        schedule_jobs()
+    return {'submitted': submitted, 'reused': reused, 'skipped': skipped, 'queue': queue_status()}
+
+
+class TaskRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+
+@app.post('/api/tasks/pause')
+def pause_tasks(request: TaskRequest):
+    # Validate every ID before changing any task, including IDs near the end.
+    rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
+    paused, skipped = [], []
+    with db_lock:
+        for original in rows:
+            row = get_row(original['id'])
+            if row['status'] not in {'queued', 'processing'}:
+                skipped.append(row['id'])
+                continue
+            job = jobs.get(job_key(row))
+            phase = 'paused'
+            if job:
+                job['paused_ids'].add(row['id'])
+                if not active_ids(job):
+                    job['pause_event'].set()
+                    if job['started']:
+                        phase = 'pausing'
+            update(row['id'], status=phase, stage='正在暂停 · 等待当前窗口结束' if phase == 'pausing' else '已暂停 · 可继续检测')
+            paused.append(row['id'])
+        schedule_jobs()
+    return {'paused': paused, 'skipped': skipped, 'queue': queue_status()}
+
+
+@app.post('/api/tasks/resume')
+def resume_tasks(request: TaskRequest):
+    rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
+    if not evaluator.ready and any(row['status'] in {'paused', 'pausing'} and not row['resume_result_json'] for row in rows):
+        raise HTTPException(503, '本地音质模型未就绪，请先运行模型安装。')
+    resumed, skipped = [], []
+    with db_lock:
+        for original in rows:
+            row = get_row(original['id'])
+            if row['status'] not in {'paused', 'pausing'}:
+                skipped.append(row['id'])
+                continue
+            task = task_document(row)
+            force = bool(task.get('force'))
+            result = json.loads(row['resume_result_json']) if row['resume_result_json'] else None
+            if result and (result.get('evaluator_version') != EVALUATOR_VERSION or
+                           result.get('quality', {}).get('model_sha256') != MODEL_SHA256):
+                result = None
+            key = job_key(row)
+            job = jobs.get(key)
+            if result is None and job is None and not force:
+                result = cached_result(row, row['scope'])
+            if result:
+                update(row['id'], status='done', progress=100, stage='检测完成 · 复用相同音频', error=None,
+                       result_json=json.dumps(reused_result(result), ensure_ascii=False), task_json='{}', resume_result_json=None)
+            else:
+                if job is None:
+                    job = jobs[key] = create_job(row, row['scope'], force, restore=True)
+                if row['id'] not in job['ids']:
+                    job['ids'].append(row['id'])
+                job['paused_ids'].discard(row['id'])
+                job['force_by_id'][row['id']] = force
+                job['pause_event'].clear()
+                update_task_rows(job, [row['id']], status='processing' if job['started'] else 'queued',
+                                 progress=job['progress'], stage=job['stage'] if job['started'] else '等待继续检测',
+                                 error=None, resume_result_json=None)
+            resumed.append(row['id'])
+        schedule_jobs()
+    return {'resumed': resumed, 'skipped': skipped, 'queue': queue_status()}
 
 
 class HumanReview(BaseModel):

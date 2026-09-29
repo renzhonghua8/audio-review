@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -31,6 +32,18 @@ CALIBRATION = np.array([
 ], dtype=np.float64)
 
 
+class EvaluationPaused(Exception):
+    """Leave an evaluation at a safe point without occupying its worker."""
+
+    info = None
+    progress = None
+
+
+def check_control(checkpoint):
+    if checkpoint:
+        checkpoint()
+
+
 def install_model(destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == MODEL_SHA256:
@@ -49,34 +62,47 @@ def install_model(destination: Path) -> Path:
     return destination
 
 
-def decode_audio(source: Path, destination: Path, *, mono_16k: bool = False) -> None:
+def decode_audio(source: Path, destination: Path, *, mono_16k: bool = False, checkpoint=None) -> None:
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
                '-y', '-threads', '1', '-filter_threads', '1', *local_input_options(), '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400']
     if mono_16k:
         command += ['-ac', '1', '-ar', str(SAMPLE_RATE)]
     command += ['-threads', '1', '-c:a', 'pcm_f32le', str(destination)]
-    execute_decode(command)
+    execute_decode(command, checkpoint)
 
 
-def execute_decode(command: list[str]) -> None:
+def execute_decode(command: list[str], checkpoint=None) -> None:
+    process = None
+    started = time.monotonic()
     try:
-        result = subprocess.run(command, capture_output=True, timeout=300)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("音频解码超时，请换用较短片段或 WAV 文件。") from error
-    if result.returncode != 0:
-        raise RuntimeError("无法读取这个文件中的音轨，请确认它是有效且未损坏的音频。")
+        check_control(checkpoint)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        while process.poll() is None:
+            check_control(checkpoint)
+            if time.monotonic() - started > 300:
+                raise RuntimeError("音频解码超时，请换用较短片段或 WAV 文件。")
+            time.sleep(.05)
+        check_control(checkpoint)
+        if process.returncode != 0:
+            raise RuntimeError("无法读取这个文件中的音轨，请确认它是有效且未损坏的音频。")
+    finally:
+        if process:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
 
 
-def decode_pair(source: Path, original: Path, mono: Path) -> None:
+def decode_pair(source: Path, original: Path, mono: Path, *, checkpoint=None) -> None:
     # Decode the compressed stream once, keeping the native acoustic branch.
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
                '-y', '-threads', '1', '-filter_threads', '1', *local_input_options(), '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400',
                '-threads', '1', '-c:a', 'pcm_f32le', str(original), '-map', '0:a:0', '-vn', '-t', '14400',
                '-ac', '1', '-ar', str(SAMPLE_RATE), '-threads', '1', '-c:a', 'pcm_f32le', str(mono)]
-    execute_decode(command)
+    execute_decode(command, checkpoint)
 
 
-def acoustic_analysis(path: Path, progress) -> dict:
+def acoustic_analysis(path: Path, progress, *, checkpoint=None) -> dict:
     with sf.SoundFile(path) as audio:
         sr, channels, frame_count = audio.samplerate, audio.channels, len(audio)
         if not frame_count:
@@ -88,6 +114,7 @@ def acoustic_analysis(path: Path, progress) -> dict:
         sum_squares, sample_count, near_full_scale, dc_sum = 0.0, 0, 0, 0.0
         max_peak = 0.0
         for index, block in enumerate(audio.blocks(blocksize=block_size * 20, dtype='float32', always_2d=True)):
+            check_control(checkpoint)
             values = np.nan_to_num(block, nan=0.0, posinf=0.0, neginf=0.0)
             squares = np.square(values, dtype=np.float64)
             absolute = np.abs(values)
@@ -185,6 +212,70 @@ def score_locations(regions: list[tuple[float, float]], scope: str) -> list[tupl
     return locations
 
 
+def read_checkpoint(path: Path, scope: str, identity: str) -> dict | None:
+    """Reject damaged or incompatible checkpoints and safely start again."""
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    def integer(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024:
+            return None
+        saved = json.loads(path.read_text())
+        if (not isinstance(saved, dict) or type(saved.get('checkpoint_version')) is not int or saved.get('checkpoint_version') != 1 or
+                saved.get('evaluator_version') != EVALUATOR_VERSION or saved.get('model_sha256') != MODEL_SHA256 or
+                saved.get('scope') != scope or saved.get('source_identity') != identity):
+            return None
+        windows, next_index, skipped, total = (saved.get(key) for key in ('windows', 'next_index', 'skipped', 'total_windows'))
+        if (not isinstance(windows, list) or not all(integer(value) for value in (next_index, skipped, total)) or
+                next_index > total or len(windows) + skipped != next_index or
+                not integer(saved.get('resume_count')) or not number(saved.get('elapsed_seconds')) or saved['elapsed_seconds'] < 0):
+            return None
+        metrics = saved.get('metrics')
+        if metrics is None:
+            return saved if next_index == skipped == total == 0 else None
+        if not isinstance(metrics, dict):
+            return None
+        duration = metrics.get('duration')
+        if not number(duration) or not 0 < duration < 14399:
+            return None
+        if any(not integer(metrics.get(key)) or metrics[key] <= 0 for key in ('sample_rate', 'channels')):
+            return None
+        scalars = ('rms_dbfs', 'peak_dbfs', 'near_full_scale_percent', 'low_energy_percent', 'dc_offset')
+        if any(not number(metrics.get(key)) for key in scalars):
+            return None
+        if metrics.get('active_level_spread_db') is not None and not number(metrics.get('active_level_spread_db')):
+            return None
+        waveform, spans, findings = (metrics.get(key) for key in ('waveform', 'low_energy_spans', 'findings'))
+        if (not isinstance(waveform, list) or not 1 <= len(waveform) <= 1000 or
+                any(not number(value) or value < 0 for value in waveform) or
+                not isinstance(spans, list) or not isinstance(findings, list)):
+            return None
+        for span in [*spans, *findings]:
+            if (not isinstance(span, dict) or not number(span.get('start')) or not number(span.get('end')) or
+                    not 0 <= span['start'] <= span['end'] <= duration + .02):
+                return None
+        if any(any(not isinstance(finding.get(key), str) for key in ('kind', 'title', 'description', 'level')) for finding in findings):
+            return None
+        expected_total = len(score_locations(score_regions(duration, scope), scope))
+        # A pause immediately after acoustic analysis precedes location setup.
+        if total != expected_total and not (total == next_index == skipped == 0 and not windows):
+            return None
+        previous_start = -1
+        for window in windows:
+            if (not isinstance(window, dict) or not number(window.get('start')) or not number(window.get('end')) or
+                    not previous_start <= window['start'] <= window['end'] <= duration + .02 or window['start'] < 0 or
+                    any(not number(window.get(key)) or not 1 <= window[key] <= 5 for key in ('overall', 'speech', 'background')) or
+                    not isinstance(window.get('padded'), bool)):
+                return None
+            previous_start = window['start']
+        return saved
+    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+        return None
+
+
 class Evaluator:
     def __init__(self, model_path: Path, *, threads: int = 2):
         self.model_path = model_path
@@ -205,25 +296,51 @@ class Evaluator:
                 self._session = ort.InferenceSession(str(self.model_path), options, providers=['CPUExecutionProvider'])
             return self._session
 
-    def evaluate(self, source: Path, folder: Path, scope: str, progress) -> dict:
+    def evaluate(self, source: Path, folder: Path, scope: str, progress, *, checkpoint=None,
+                 source_identity: str | None = None) -> dict:
         if scope not in SCOPE_LABELS:
             raise RuntimeError('请选择有效的评分模式。')
         started = time.perf_counter()
         folder.mkdir(parents=True, exist_ok=True)
         original, mono = folder / 'decoded-original.wav', folder / 'decoded-16k.wav'
+        saved_path = folder / 'checkpoint.json'
+        identity = source_identity or str(source.resolve())
+        state = {'checkpoint_version': 1, 'evaluator_version': EVALUATOR_VERSION, 'model_sha256': MODEL_SHA256,
+                 'scope': scope, 'source_identity': identity,
+                 'metrics': None, 'windows': [], 'next_index': 0, 'skipped': 0, 'total_windows': 0,
+                 'elapsed_seconds': 0, 'resume_count': 0}
+        if saved := read_checkpoint(saved_path, scope, identity):
+            state.update(saved)
+            state['resume_count'] += 1
+        paused = False
         try:
-            progress(3, '读取音频')
-            decode_pair(source, original, mono)
-            metrics = acoustic_analysis(original, progress)
+            check_control(checkpoint)
+            progress(3, '继续读取音频' if state['resume_count'] else '读取音频', self.task_info(state))
+            if state['metrics'] is None:
+                decode_pair(source, original, mono, checkpoint=checkpoint)
+                metrics = acoustic_analysis(original, progress, checkpoint=checkpoint)
+                state['metrics'] = metrics
+                original.unlink(missing_ok=True)
+            else:
+                # Paused jobs retain compact checkpoints, not multi-GB decoded WAVs.
+                # Only the mono scoring branch needs to be read again on resume.
+                decode_audio(source, mono, mono_16k=True, checkpoint=checkpoint)
+                metrics = state['metrics']
+            check_control(checkpoint)
             progress(32, '准备音质评分')
             if not self.ready:
                 raise RuntimeError('本地 DNSMOS 音质模型未就绪，请先安装模型后重试。')
             regions = score_regions(metrics['duration'], scope)
-            windows, skipped = [], 0
+            windows, skipped = state['windows'], state['skipped']
             locations = score_locations(regions, scope)
+            state['total_windows'] = len(locations)
+            progress(35 + int(60 * state['next_index'] / max(len(locations), 1)),
+                     f"音质评分 {state['next_index']}/{len(locations)}", self.task_info(state))
             session = self.session()
             with sf.SoundFile(mono) as audio:
-                for index, (start, end, padded) in enumerate(locations):
+                for index in range(state['next_index'], len(locations)):
+                    check_control(checkpoint)
+                    start, end, padded = locations[index]
                     audio.seek(min(int(start * SAMPLE_RATE), max(0, len(audio) - 1)))
                     samples = audio.read(min(WINDOW_SAMPLES, round((end - start) * SAMPLE_RATE)), dtype='float32')
                     if not len(samples) or float(np.sqrt(np.mean(samples.astype('float64') ** 2))) < 10 ** (-55 / 20):
@@ -237,8 +354,12 @@ class Evaluator:
                         windows.append({'start': round(start, 2), 'end': round(min(end, metrics['duration']), 2),
                                         'speech': round(float(bounded[0]), 3), 'background': round(float(bounded[1]), 3),
                                         'overall': round(float(bounded[2]), 3), 'padded': padded})
+                    state.update(next_index=index + 1, skipped=skipped)
                     if index % 5 == 0 or index == len(locations) - 1:
-                        progress(35 + int(60 * (index + 1) / max(len(locations), 1)), f'音质评分 {index + 1}/{len(locations)}')
+                        progress(35 + int(60 * (index + 1) / max(len(locations), 1)),
+                                 f'音质评分 {index + 1}/{len(locations)}', self.task_info(state))
+                    check_control(checkpoint)
+            check_control(checkpoint)
             overall = float(np.mean([w['overall'] for w in windows])) if windows else None
             if windows:
                 worst = sorted(windows, key=lambda item: item['overall'])
@@ -274,11 +395,29 @@ class Evaluator:
             }
             metrics['findings'].sort(key=lambda item: item['start'])
             return {'metrics': metrics, 'quality': score, 'evaluator_version': EVALUATOR_VERSION,
-                    'processing': {'elapsed_seconds': round(time.perf_counter() - started, 3), 'cache_hit': False},
+                    'processing': {'elapsed_seconds': round(state['elapsed_seconds'] + time.perf_counter() - started, 3),
+                                   'cache_hit': False, 'resume_count': state['resume_count']},
                     'subjective_status': 'requires_human_calibration',
                     'limitations': ['模型分数是人声及背景音质的预测值，不能代替自然度、内容或合成来源判断。',
                                     '背景音乐可能影响背景质量分；异常提示需要回听确认。',
                                     '自动与人工评分独立保存；未输出未经验证的主观自动分。']}
+        except EvaluationPaused as error:
+            paused = True
+            state['elapsed_seconds'] += time.perf_counter() - started
+            temporary = folder / 'checkpoint.part.json'
+            temporary.write_text(json.dumps(state, ensure_ascii=False))
+            temporary.replace(saved_path)
+            error.info = self.task_info(state)
+            error.progress = 35 + int(60 * state['next_index'] / max(state['total_windows'], 1)) if state['metrics'] else 3
+            raise
         finally:
             original.unlink(missing_ok=True)
             mono.unlink(missing_ok=True)
+            if not paused:
+                saved_path.unlink(missing_ok=True)
+            (folder / 'checkpoint.part.json').unlink(missing_ok=True)
+
+    @staticmethod
+    def task_info(state):
+        return {'processed_windows': state['next_index'], 'scored_windows': len(state['windows']),
+                'total_windows': state['total_windows'], 'resume_count': state['resume_count']}

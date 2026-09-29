@@ -78,6 +78,12 @@ jobs:
             python3 scripts/parallel-smoke-test.py | tee "$report_dir/api.log"
           docker exec -e FORMAT_TEST_DISPOSABLE=1 audio-review-parallel-ci \
             python scripts/media-smoke-test.py | tee "$report_dir/media-format-summary.json"
+          existing_ip="$(docker inspect --format '{{.NetworkSettings.IPAddress}}' "$EXISTING_SERVICE_ID")"
+          docker exec -e TASK_CONTROL_TEST_DISPOSABLE=1 \
+            -e TASK_CONTROL_REPORT_DIR=/tmp/task-control-ci \
+            -e TASK_CONTROL_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review-parallel-ci python scripts/task-control-smoke-test.py \
+            | tee "$report_dir/task-control.log"
           touch "$report_dir/stop-monitor"
           wait "$monitor_pid"
           python3 scripts/container-resource-check.py verify "$report_dir" | tee "$report_dir/resources.log"
@@ -87,6 +93,21 @@ jobs:
             --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
           printf 'Existing service kept the same container ID, stayed running, and served HTTP 200 before, during, and after both rounds.\n' \
             > "$report_dir/existing-service.log"
+      - name: Verify paused tasks survive restarting only the disposable container
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/audio-review-parallel-check"
+          docker restart --time -1 audio-review-parallel-ci
+          existing_ip="$(docker inspect --format '{{.NetworkSettings.IPAddress}}' "$EXISTING_SERVICE_ID")"
+          docker exec -e TASK_CONTROL_TEST_DISPOSABLE=1 \
+            -e TASK_CONTROL_REPORT_DIR=/tmp/task-control-ci \
+            -e TASK_CONTROL_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review-parallel-ci python scripts/task-control-smoke-test.py --phase verify-restart \
+            | tee "$report_dir/task-control-restart.log"
+          test "$(docker inspect --format '{{.Id}}' audio-review-ci-existing-service)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
       - name: Save a bounded summary and remove only the CI fixtures
         if: always()
         run: |
@@ -94,6 +115,7 @@ jobs:
           mkdir -p "$report_dir"
           docker logs --tail 100 audio-review-ci || true
           docker logs --tail 200 audio-review-parallel-ci > "$report_dir/container.log" 2>&1 || true
+          docker cp audio-review-parallel-ci:/tmp/task-control-ci/. "$report_dir/" || true
           if [[ -f "$report_dir/resource-summary.json" ]]; then
             printf '### Two concurrent real model jobs, 768 MiB, 0.5 CPU, no swap\n\n```json\n' >> "$GITHUB_STEP_SUMMARY"
             cat "$report_dir/resource-summary.json" >> "$GITHUB_STEP_SUMMARY"
