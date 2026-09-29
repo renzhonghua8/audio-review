@@ -50,6 +50,98 @@ jobs:
         run: |
           docker logs --tail 100 audio-review-ci
           docker rm -f audio-review-ci
+      - name: Verify a forced upgrade interrupts only the owned audio-review service
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/audio-review-parallel-check"
+          mkdir -p "$report_dir"
+          managed_label=io.github.renzhonghua8.audio-review.managed
+          old_id=''
+          monitor_pid=''
+          stop_monitor="$report_dir/stop-interrupt-service-monitor"
+          check_existing() {
+            test "$(docker inspect --format '{{.Id}}' audio-review-ci-existing-service)" = "$EXISTING_SERVICE_ID" \
+              && test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true \
+              && test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+              --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+          }
+          owned_upgrade_fixture() {
+            local identifier="$1"
+            [[ -n "$identifier" ]] && docker container inspect "$identifier" >/dev/null 2>&1 || return 1
+            test "$(docker inspect --format "{{index .Config.Labels \"$managed_label\"}}" "$identifier")" = true \
+              && test "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$identifier")" = /opt/audio-review/data
+          }
+          finish() {
+            result=$?
+            trap - EXIT
+            touch "$stop_monitor"
+            if [[ -n "$monitor_pid" ]]; then wait "$monitor_pid" || result=1; fi
+            for identifier in audio-review "$old_id"; do
+              if owned_upgrade_fixture "$identifier"; then
+                docker logs --tail 200 "$identifier" >> "$report_dir/interrupt-upgrade-container.log" 2>&1 || true
+                for evidence in ci-interrupt-state.json ci-interrupt-summary.json; do
+                  docker cp "$identifier:/data/$evidence" "$report_dir/$evidence" || true
+                done
+                docker rm -f "$identifier" || result=1
+              fi
+            done
+            check_existing || result=1
+            exit "$result"
+          }
+          check_existing
+          if docker container inspect audio-review >/dev/null 2>&1; then
+            echo 'The disposable runner already has an audio-review container; refusing to replace it.' >&2
+            exit 1
+          fi
+          printf 'INTERRUPT_UPGRADE_CI_RUN=1\n' >> "$GITHUB_ENV"
+          trap finish EXIT
+          (
+            while [[ ! -e "$stop_monitor" ]]; do
+              status="$(curl --silent --max-time 3 --output /dev/null \
+                --write-out '%{http_code}' http://127.0.0.1:9009/)" || status='unavailable'
+              printf '%s HTTP %s\n' "$(date -u +%FT%TZ)" "$status" \
+                >> "$report_dir/interrupt-upgrade-existing-service.log"
+              [[ "$status" == 200 ]] || exit 1
+              sleep .5
+            done
+          ) &
+          monitor_pid=$!
+          deploy_version="$(awk -F= '$1 == "VERSION" {version=$2; count++} END {if (count != 1) exit 1; print version}' scripts/deploy-docker.sh)"
+          [[ "$deploy_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          docker tag audio-review:ci "audio-review:$deploy_version"
+          server_ip="$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<NF; i++) if ($i == "src") {print $(i+1); exit}}')"
+          test -n "$server_ip"
+          sudo -n env AUDIO_REVIEW_MEMORY_MB=768 AUDIO_REVIEW_WORKERS=2 AUDIO_REVIEW_MODEL_THREADS=1 \
+            bash scripts/deploy-docker.sh "$server_ip" | tee "$report_dir/interrupt-upgrade-first-deploy.log"
+          old_id="$(docker inspect --format '{{.Id}}' audio-review)"
+          printf 'INTERRUPT_UPGRADE_OLD_ID=%s\n' "$old_id" >> "$GITHUB_ENV"
+          owned_upgrade_fixture "$old_id"
+          docker inspect "$old_id" > "$report_dir/interrupt-upgrade-old-container.json"
+          test "$(docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}}' "$old_id")" = '805306368 805306368 500000000'
+          docker exec audio-review python scripts/smoke-test.py | tee "$report_dir/interrupt-upgrade-baseline.log"
+          existing_ip="$(docker inspect --format '{{.NetworkSettings.IPAddress}}' "$EXISTING_SERVICE_ID")"
+          docker exec -e INTERRUPT_UPGRADE_TEST_DISPOSABLE=1 \
+            -e INTERRUPT_UPGRADE_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review python scripts/interrupt-upgrade-smoke-test.py --phase prepare \
+            | tee "$report_dir/interrupt-upgrade-prepare.log"
+          check_existing
+          sudo -n env AUDIO_REVIEW_MEMORY_MB=768 AUDIO_REVIEW_WORKERS=2 AUDIO_REVIEW_MODEL_THREADS=1 \
+            bash scripts/deploy-docker.sh "$server_ip" --upgrade --stop-first --interrupt-tasks \
+            | tee "$report_dir/interrupt-upgrade-deploy.log"
+          new_id="$(docker inspect --format '{{.Id}}' audio-review)"
+          test "$new_id" != "$old_id"
+          owned_upgrade_fixture "$new_id"
+          docker inspect "$new_id" > "$report_dir/interrupt-upgrade-new-container.json"
+          test "$(docker inspect --format '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.NanoCpus}}' "$new_id")" = '805306368 805306368 500000000'
+          docker exec -e INTERRUPT_UPGRADE_TEST_DISPOSABLE=1 \
+            -e INTERRUPT_UPGRADE_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review python scripts/interrupt-upgrade-smoke-test.py --phase verify \
+            | tee "$report_dir/interrupt-upgrade-verify.log"
+          check_existing
+          printf 'Old audio-review ID: %s\nNew audio-review ID: %s\nExisting service ID before and after: %s\n' \
+            "$old_id" "$new_id" "$EXISTING_SERVICE_ID" > "$report_dir/interrupt-upgrade-container-identity.log"
+          printf 'The separate existing service retained its ID and running state, and every probe returned HTTP 200.\n' \
+            >> "$report_dir/interrupt-upgrade-existing-service.log"
       - name: Verify two real model jobs under 768 MiB and 0.5 CPU
         run: |
           set -euo pipefail
@@ -116,6 +208,25 @@ jobs:
           docker logs --tail 100 audio-review-ci || true
           docker logs --tail 200 audio-review-parallel-ci > "$report_dir/container.log" 2>&1 || true
           docker cp audio-review-parallel-ci:/tmp/task-control-ci/. "$report_dir/" || true
+          if [[ "${INTERRUPT_UPGRADE_CI_RUN:-}" == 1 ]]; then
+            for identifier in audio-review "${INTERRUPT_UPGRADE_OLD_ID:-}"; do
+              [[ -n "$identifier" ]] || continue
+              if docker container inspect "$identifier" >/dev/null 2>&1 \
+                && [[ "$(docker inspect --format '{{index .Config.Labels "io.github.renzhonghua8.audio-review.managed"}}' "$identifier")" == true ]] \
+                && [[ "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$identifier")" == /opt/audio-review/data ]]; then
+                docker logs --tail 200 "$identifier" >> "$report_dir/interrupt-upgrade-container.log" 2>&1 || true
+                for evidence in ci-interrupt-state.json ci-interrupt-summary.json; do
+                  docker cp "$identifier:/data/$evidence" "$report_dir/$evidence" || true
+                done
+                docker rm -f "$identifier" || true
+              fi
+            done
+          fi
+          if [[ -f "$report_dir/ci-interrupt-summary.json" ]]; then
+            printf '### Actual host-script upgrade with an active real model task\n\n```json\n' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report_dir/ci-interrupt-summary.json" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [[ -f "$report_dir/resource-summary.json" ]]; then
             printf '### Two concurrent real model jobs, 768 MiB, 0.5 CPU, no swap\n\n```json\n' >> "$GITHUB_STEP_SUMMARY"
             cat "$report_dir/resource-summary.json" >> "$GITHUB_STEP_SUMMARY"

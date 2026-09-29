@@ -17,18 +17,21 @@ MEMORY_MB=''
 SERVER_IP=''
 UPGRADE=false
 STOP_FIRST=false
+INTERRUPT_TASKS=false
 
 fail() { echo "$*" >&2; exit 1; }
 for argument in "$@"; do
   case "$argument" in
     --upgrade) UPGRADE=true ;;
     --stop-first) STOP_FIRST=true ;;
-    --*) fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first]]' ;;
-    *) [[ -z "$SERVER_IP" ]] || fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first]]'
+    --interrupt-tasks) INTERRUPT_TASKS=true ;;
+    --*) fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first] [--interrupt-tasks]]' ;;
+    *) [[ -z "$SERVER_IP" ]] || fail '用法：bash scripts/deploy-docker.sh [实际网卡IPv4] [--upgrade [--stop-first] [--interrupt-tasks]]'
        SERVER_IP="$argument" ;;
   esac
 done
 if $STOP_FIRST && ! $UPGRADE; then fail '--stop-first 必须与 --upgrade 联用。'; fi
+if $INTERRUPT_TASKS && ! $UPGRADE; then fail '--interrupt-tasks 必须与 --upgrade 联用。'; fi
 [[ $(id -u) -eq 0 ]] || fail '请以 root 执行部署。'
 for required_tool in ip ss docker awk df curl sha256sum tar; do
   command -v "$required_tool" >/dev/null || fail "缺少 ${required_tool}；请先安装该工具，本脚本不会修改系统软件。"
@@ -121,6 +124,7 @@ if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
   [[ "$previous_data" == "$DATA_DIR" ]] || fail "旧容器数据目录为 ${previous_data}，拒绝自动修改。"
 fi
 if $STOP_FIRST && ! $exists; then fail '--stop-first 只适用于已确认归属的现有声检容器。'; fi
+if $INTERRUPT_TASKS && ! $exists; then fail '--interrupt-tasks 只适用于已确认归属的现有声检容器。'; fi
 
 check_port() {
   local running bindings name owned_bindings='' listener listeners
@@ -226,6 +230,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 check_previous_queue() {
+  $INTERRUPT_TASKS && return 0
   if $previous_running && ! $previous_stopped; then
     docker exec "$previous_id" python -c '
 import json, os, sys
@@ -248,7 +253,10 @@ stop_previous() {
     # Arm rollback before stopping: even a failed stop may have stopped the container.
     restore_pending=true
     echo "记录原声检容器 ID：${previous_id}；失败时按原容器配置恢复。"
-    if $STOP_FIRST; then
+    if $INTERRUPT_TASKS; then
+      echo '已请求中断声检任务后升级；只停止原声检，最多等待 30 秒正常退出。未完成任务可能需要重新检测。'
+      docker stop --time 30 "$previous_id"
+    elif $STOP_FIRST; then
       echo '先关闭空闲的原声检以释放内存；等待正常退出，不强制结束检测。'
       docker stop --time -1 "$previous_id"
     else

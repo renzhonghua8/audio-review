@@ -135,6 +135,30 @@ DEPLOY
 
 仅声检会在此次升级中暂停，暂停时间包含下载、导入、备份和启动。初始内存足够时先下载校验再关闭；不足时先关闭再下载。下载、校验、镜像导入、备份、替换、内存复查或健康检查失败，均尝试恢复原容器的 ID、名称和先前运行状态。正常关闭不设强杀超时；评测与回听后台任务由应用退出流程结束。原音频和评分保留，其他容器不参与恢复操作。
 
+### 中断当前声检任务后升级
+
+如果不能等待任务完成，也无法在旧版网页暂停，可显式增加 `--interrupt-tasks`。该选项必须与 `--upgrade` 联用，只适用于已确认管理标记与独立数据挂载的现有声检。它跳过任务队列检查，给原声检最多 30 秒正常退出；超时后 Docker 结束该容器。内存余量、CPU/内存限制、端口、容器归属、数据备份与失败恢复检查仍保留。
+
+已经保存的音频、自动结果和人工评分保留。运行和排队中的任务会被中断，升级后可能回到“等待重新检测”，需要重新提交检测；仅明确暂停且检查点有效的任务保留断点。失败后尝试恢复旧容器也不会自动接着旧版未完成的评测。
+
+```bash
+set +e
+bash <<'DEPLOY'
+set -e
+cd /opt/audio-review/src
+git pull --ff-only
+AUDIO_REVIEW_MEMORY_MB=768 \
+AUDIO_REVIEW_WORKERS=2 \
+AUDIO_REVIEW_MODEL_THREADS=1 \
+AUDIO_REVIEW_EXTRA_ORIGINS='http://43.165.169.160:8001' \
+bash scripts/deploy-docker.sh --upgrade --stop-first --interrupt-tasks
+docker inspect --format '{{.Config.Image}}' audio-review
+docker logs --tail 30 audio-review
+DEPLOY
+```
+
+该开关属于宿主部署脚本，复用已经发布的 `audio-review:2.0.8` 镜像。更新仓库脚本后即可使用，无需重新构建镜像。关闭旧声检后可用内存仍不足 1280 MiB 时会停止升级并尝试恢复旧实例，不能用该选项绕过资源保护。
+
 ## 域名与云服务器公网地址
 
 自动识别的 IP 是绑定宿主网卡的地址。如果通过 VPN 或公司内网使用该地址，不需要额外配置。使用公网映射或域名访问时，应另外配置**实际浏览器访问来源**；绑定 IP 仍为网卡地址，不要改为 NAT 公网 IP。例如：
