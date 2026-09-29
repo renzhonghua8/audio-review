@@ -1,0 +1,293 @@
+name: Measure the released model under smaller memory limits
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audio-review-memory-profile
+  cancel-in-progress: false
+
+jobs:
+  profile:
+    if: github.repository == 'renzhonghua8/audio-review'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        memory: ['512m', '768m']
+    env:
+      IMAGE: audio-review:2.0.2
+      CONTAINER: audio-review-memory-${{ matrix.memory }}
+      RELEASE_SHA256: c8d6eceee4da0ec1c914a65c95986222d0fdd9cd40ad29849103193948cdf86e
+      PROFILE_DIR: ${{ runner.temp }}/memory-profile
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download and verify the existing v2.0.2 Linux image
+        run: |
+          set -euo pipefail
+          mkdir -p "$PROFILE_DIR" "$RUNNER_TEMP/released-image"
+          cd "$RUNNER_TEMP/released-image"
+          base=https://github.com/renzhonghua8/audio-review/releases/download/v2.0.2
+          for asset in audio-review-linux-amd64.tar.gz audio-review-linux-amd64.tar.gz.sha256; do
+            curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+              "$base/$asset" --output "$asset"
+          done
+          sha256sum --check audio-review-linux-amd64.tar.gz.sha256
+          test "$(sha256sum audio-review-linux-amd64.tar.gz | cut -d ' ' -f 1)" = "$RELEASE_SHA256"
+          docker load --input audio-review-linux-amd64.tar.gz
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE")" = amd64
+          test "$(docker image inspect --format '{{index .Config.Labels "io.github.renzhonghua8.audio-review.managed"}}' "$IMAGE")" = true
+          docker image inspect "$IMAGE" > "$PROFILE_DIR/image.json"
+          cp audio-review-linux-amd64.tar.gz.sha256 "$PROFILE_DIR/image.sha256"
+      - name: Prepare a host-side API test and a cgroup memory monitor
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/memory-profile-api.py" <<'PY'
+          """Real model execution on non-silent fixtures; no accuracy claim."""
+          import array
+          import http.client
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import time
+          import uuid
+          import wave
+          from urllib.request import ProxyHandler, Request, build_opener
+
+          output = Path(os.environ['PROFILE_DIR'])
+          client = build_opener(ProxyHandler({}))
+          port = int(os.environ.get('PROFILE_PORT', '8001'))
+          base = f'http://127.0.0.1:{port}'
+
+          def api(path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              headers = {'Content-Type': 'application/json'} if data else {}
+              with client.open(Request(base + path, data=data, headers=headers), timeout=30) as response:
+                  return json.load(response)
+
+          def fixture(path, seconds, rate=48000, channels=2):
+              # Generate and write one second at a time; test clients run outside the container.
+              with wave.open(str(path), 'wb') as audio:
+                  audio.setparams((channels, 2, rate, 0, 'NONE', 'not compressed'))
+                  block = array.array('h')
+                  for index in range(rate):
+                      left = round(3500 * math.sin(2 * math.pi * 440 * index / rate))
+                      right = round(2600 * math.sin(2 * math.pi * 660 * index / rate))
+                      block.extend([left, right] if channels == 2 else [left])
+                  if os.sys.byteorder != 'little':
+                      block.byteswap()
+                  pcm = block.tobytes()
+                  for _ in range(seconds):
+                      audio.writeframesraw(pcm)
+
+          def upload(path):
+              boundary = uuid.uuid4().hex
+              head = (f'--{boundary}\r\nContent-Disposition: form-data; name="files"; '
+                      f'filename="{path.name}"\r\nContent-Type: audio/wav\r\n\r\n').encode()
+              tail = f'\r\n--{boundary}--\r\n'.encode()
+              connection = http.client.HTTPConnection('127.0.0.1', port, timeout=180)
+              try:
+                  connection.putrequest('POST', '/api/upload')
+                  connection.putheader('Content-Type', f'multipart/form-data; boundary={boundary}')
+                  connection.putheader('Content-Length', len(head) + path.stat().st_size + len(tail))
+                  connection.endheaders()
+                  connection.send(head)
+                  with path.open('rb') as source:
+                      while chunk := source.read(1024 * 1024):
+                          connection.send(chunk)
+                  connection.send(tail)
+                  response = connection.getresponse()
+                  document = json.loads(response.read())
+                  assert response.status == 200, (response.status, document)
+                  assert len(document['items']) == 1, document
+                  return document['items'][0]['id']
+              finally:
+                  connection.close()
+
+          cases = []
+          def evaluate(identifier, scope, expected_seconds, expected_windows, force=False):
+              started = time.monotonic()
+              submitted = api('/api/run', {'ids': [identifier], 'scope': scope, 'force': force})
+              assert submitted['submitted'] == [identifier] and not submitted['reused'], submitted
+              deadline = started + 360
+              while time.monotonic() < deadline:
+                  row = api('/api/reviews/' + identifier)
+                  assert row['status'] != 'error', row
+                  if row['status'] == 'done':
+                      break
+                  time.sleep(.5)
+              else:
+                  raise RuntimeError(f'{scope} evaluation timed out after 360 seconds')
+              result = row['result']
+              quality, metrics = result['quality'], result['metrics']
+              assert result['evaluator_version'] == '2.0', result
+              assert metrics['sample_rate'] == 48000 and metrics['channels'] == 2, metrics
+              assert abs(metrics['duration'] - expected_seconds) < .01, metrics
+              assert quality['scope'] == scope and quality['status'] == 'scored', quality
+              assert quality['window_count'] == expected_windows, quality
+              assert quality['skipped_low_energy_windows'] == 0, quality
+              assert quality['model_sha256'] == '269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd', quality
+              assert 1 <= quality['overall'] <= 5 and not result['processing']['cache_hit'], result
+              assert api('/api/health')['ready']
+              cases.append({'scope': scope, 'force': force, 'duration_seconds': metrics['duration'],
+                            'channels': metrics['channels'], 'sample_rate': metrics['sample_rate'],
+                            'window_count': quality['window_count'], 'elapsed_seconds': round(time.monotonic() - started, 3),
+                            'overall': quality['overall'], 'processing': result['processing']})
+              (output / 'cases.json').write_text(json.dumps(cases, indent=2) + '\n')
+              print(json.dumps(cases[-1]), flush=True)
+
+          health = api('/api/health')
+          assert health['workers'] == health['model_threads'] == 1, health
+          long_path = Path(os.environ['RUNNER_TEMP']) / 'synthetic-10min-48k-stereo.wav'
+          fixture(long_path, 600)
+          long_id = upload(long_path)
+          # Repeated non-cached inference exposes retained allocator state and long-file decoding.
+          for attempt in range(3):
+              evaluate(long_id, 'fast', 600, 67, force=bool(attempt))
+          short_path = Path(os.environ['RUNNER_TEMP']) / 'synthetic-30sec-48k-stereo.wav'
+          fixture(short_path, 30)
+          evaluate(upload(short_path), 'full', 30, 22)
+          assert all(row['status'] == 'done' for row in api('/api/reviews?compact=true')['items'])
+          print('PASS: three real 10-minute fast runs and one 30-second full run, 48 kHz stereo, one worker.')
+          print('Synthetic signals measure execution and memory; these results do not establish prediction accuracy or all-input safety.')
+          PY
+          cat > "$RUNNER_TEMP/memory-profile-monitor.py" <<'PY'
+          """Read kernel cgroup usage including file cache; docker stats alone hides cache."""
+          import json
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          container, output_name = sys.argv[1:]
+          output = Path(output_name)
+          running = True
+          def stop(*_):
+              global running
+              running = False
+          signal.signal(signal.SIGTERM, stop)
+          signal.signal(signal.SIGINT, stop)
+
+          def inspect():
+              return json.loads(subprocess.check_output(['docker', 'inspect', container], text=True))[0]
+
+          def number(path):
+              try:
+                  text = path.read_text().strip()
+                  return int(text) if text != 'max' else None
+              except (OSError, ValueError):
+                  return None
+
+          def pairs(path):
+              try:
+                  return {key: int(value) for key, value in (line.split() for line in path.read_text().splitlines())}
+              except (OSError, ValueError):
+                  return {}
+
+          info = inspect()
+          pid = info['State']['Pid']
+          assert pid > 0, info['State']
+          entries = [line.split(':', 2) for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()]
+          unified = next((relative for _, controllers, relative in entries if not controllers), None)
+          if unified is not None:
+              version = 2
+              memory = Path('/sys/fs/cgroup') / unified.lstrip('/')
+              pids = memory
+          else:
+              version = 1
+              memory = Path('/sys/fs/cgroup/memory') / next(relative for _, controllers, relative in entries if 'memory' in controllers.split(',')).lstrip('/')
+              pids = Path('/sys/fs/cgroup/pids') / next(relative for _, controllers, relative in entries if 'pids' in controllers.split(',')).lstrip('/')
+          assert memory.is_dir(), str(memory)
+          metadata = {'cgroup_version': version, 'cgroup_path': str(memory), 'initial_pid': pid,
+                      'image_id': info['Image'], 'host_config': {key: info['HostConfig'].get(key) for key in ('Memory', 'MemorySwap', 'NanoCpus')}}
+          (output / 'cgroup.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          maxima = {'observed_current_bytes': 0, 'kernel_peak_bytes': 0, 'anon_bytes': 0, 'file_bytes': 0,
+                    'pids_current': 0, 'oom': 0, 'oom_kill': 0}
+          count = 0
+          with (output / 'memory-samples.jsonl').open('w') as samples:
+              while running and not (output / 'stop-monitor').exists():
+                  stats = pairs(memory / 'memory.stat')
+                  events = pairs(memory / ('memory.events' if version == 2 else 'memory.oom_control'))
+                  current = number(memory / ('memory.current' if version == 2 else 'memory.usage_in_bytes'))
+                  peak = number(memory / ('memory.peak' if version == 2 else 'memory.max_usage_in_bytes'))
+                  row = {'time': time.time(), 'observed_current_bytes': current, 'kernel_peak_bytes': peak,
+                         'anon_bytes': stats.get('anon' if version == 2 else 'total_rss'),
+                         'file_bytes': stats.get('file' if version == 2 else 'total_cache'),
+                         'pids_current': number(pids / 'pids.current'), 'oom': events.get('oom'),
+                         'oom_kill': events.get('oom_kill'), 'swap_current_bytes': number(memory / 'memory.swap.current') if version == 2 else None}
+                  for key in maxima:
+                      if row[key] is not None:
+                          maxima[key] = max(maxima[key], row[key])
+                  samples.write(json.dumps(row) + '\n')
+                  samples.flush()
+                  count += 1
+                  time.sleep(.1)
+          info = inspect()
+          summary = {**metadata, 'sample_count': count, 'maxima': maxima, 'final_state': info['State']}
+          (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/memory-profile-api.py" "$RUNNER_TEMP/memory-profile-monitor.py"
+      - name: Run real decoding and inference with no swap and record the peak
+        run: |
+          set -euo pipefail
+          docker run -d --name "$CONTAINER" --init --restart no \
+            --cpus 0.5 --memory '${{ matrix.memory }}' --memory-swap '${{ matrix.memory }}' \
+            -e AUDIO_REVIEW_WORKERS=1 -e AUDIO_REVIEW_MODEL_THREADS=1 \
+            -p 127.0.0.1:8001:8001 "$IMAGE"
+          sudo -n python3 "$RUNNER_TEMP/memory-profile-monitor.py" "$CONTAINER" "$PROFILE_DIR" &
+          monitor_pid=$!
+          finish() {
+            result=$?
+            trap - EXIT
+            touch "$PROFILE_DIR/stop-monitor"
+            wait "$monitor_pid" || true
+            docker inspect "$CONTAINER" > "$PROFILE_DIR/final-container.json" || true
+            docker logs "$CONTAINER" > "$PROFILE_DIR/container.log" 2>&1 || true
+            cat "$PROFILE_DIR/summary.json" || true
+            exit "$result"
+          }
+          trap finish EXIT
+          # The shipped API smoke test also exercises duplicate reuse and independent human ratings.
+          docker exec "$CONTAINER" python scripts/smoke-test.py | tee "$PROFILE_DIR/smoke.log"
+          python3 "$RUNNER_TEMP/memory-profile-api.py" | tee "$PROFILE_DIR/api.log"
+          touch "$PROFILE_DIR/stop-monitor"
+          wait "$monitor_pid"
+          python3 - "$PROFILE_DIR/summary.json" <<'PY'
+          import json
+          import sys
+          summary = json.load(open(sys.argv[1]))
+          print(json.dumps(summary, indent=2))
+          assert summary['sample_count'] > 10, summary
+          assert summary['final_state']['Running'] and not summary['final_state']['OOMKilled'], summary
+          assert summary['maxima']['oom_kill'] == 0, summary
+          assert summary['maxima']['kernel_peak_bytes'] > 0, summary
+          PY
+      - name: Save measurements and remove only this CI container
+        if: always()
+        run: |
+          mkdir -p "$PROFILE_DIR"
+          docker inspect "$CONTAINER" > "$PROFILE_DIR/final-container.json" || true
+          docker logs "$CONTAINER" > "$PROFILE_DIR/container.log" 2>&1 || true
+          if [[ -f "$PROFILE_DIR/summary.json" ]]; then
+            printf '### %s, 0.5 CPU, no swap\n' '${{ matrix.memory }}' >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```json\n' >> "$GITHUB_STEP_SUMMARY"
+            cat "$PROFILE_DIR/summary.json" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n\nThese synthetic fixtures check execution and memory, not prediction accuracy or all-input safety.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          docker rm -f "$CONTAINER" || true
+      - name: Retain bounded measurement logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memory-profile-${{ matrix.memory }}
+          path: ${{ runner.temp }}/memory-profile/
+          retention-days: 7
+          if-no-files-found: warn
