@@ -49,10 +49,10 @@ def install_model(destination: Path) -> Path:
 
 def decode_audio(source: Path, destination: Path, *, mono_16k: bool = False) -> None:
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
-               '-y', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400']
+               '-y', '-threads', '1', '-filter_threads', '1', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400']
     if mono_16k:
         command += ['-ac', '1', '-ar', str(SAMPLE_RATE)]
-    command += ['-c:a', 'pcm_f32le', str(destination)]
+    command += ['-threads', '1', '-c:a', 'pcm_f32le', str(destination)]
     execute_decode(command)
 
 
@@ -68,9 +68,9 @@ def execute_decode(command: list[str]) -> None:
 def decode_pair(source: Path, original: Path, mono: Path) -> None:
     # Decode the compressed stream once, keeping the native acoustic branch.
     command = [imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-hide_banner', '-loglevel', 'error',
-               '-y', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400',
-               '-c:a', 'pcm_f32le', str(original), '-map', '0:a:0', '-vn', '-t', '14400',
-               '-ac', '1', '-ar', str(SAMPLE_RATE), '-c:a', 'pcm_f32le', str(mono)]
+               '-y', '-threads', '1', '-filter_threads', '1', '-i', str(source), '-map', '0:a:0', '-vn', '-t', '14400',
+               '-threads', '1', '-c:a', 'pcm_f32le', str(original), '-map', '0:a:0', '-vn', '-t', '14400',
+               '-ac', '1', '-ar', str(SAMPLE_RATE), '-threads', '1', '-c:a', 'pcm_f32le', str(mono)]
     execute_decode(command)
 
 

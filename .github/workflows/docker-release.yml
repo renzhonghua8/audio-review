@@ -4,7 +4,7 @@ on:
   push:
     tags: ['v*']
   # A manual rerun must select an existing version tag, for example:
-  # gh workflow run docker-release.yml --ref v2.0.3
+  # gh workflow run docker-release.yml --ref v2.0.4
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           if [[ "$GITHUB_REF" != refs/tags/* ]] ||
              [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'Run this workflow from an existing version tag such as v2.0.3.' >&2
+            echo 'Run this workflow from an existing version tag such as v2.0.4.' >&2
             exit 1
           fi
           printf 'IMAGE=audio-review:%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -147,7 +147,7 @@ jobs:
                   assert hashlib.sha256(response.read()).hexdigest() == row['sha256']
           health = api('/api/health')
           assert health['ready'] and health['evaluator_version'] == '2.0'
-          assert health['workers'] == health['model_threads'] == 1
+          assert health['workers'] == 2 and health['model_threads'] == 1
           target = next(row for row in before if row['review'])
           submitted = api('/api/run', {'ids': [target['id']], 'scope': 'fast', 'force': True})
           assert submitted['submitted'] == [target['id']] and not submitted['reused']

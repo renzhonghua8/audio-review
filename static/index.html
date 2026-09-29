@@ -25,7 +25,18 @@
     <div class="main-grid">
       <section class="queue-panel panel">
         <div class="panel-heading"><div><span class="eyebrow">01 / 导入与检测</span><h2>评测队列</h2></div><button class="icon-button" id="refresh-button" title="刷新队列" aria-label="刷新队列">↻</button></div>
-        <label class="dropzone" id="dropzone" tabindex="0"><input id="file-input" type="file" accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.mp4,.aiff,.aif" multiple hidden><span class="upload-icon">＋</span><strong>拖入音频，或点击选择</strong><span>MP3 / WAV / M4A / FLAC 等 · 每批最多 20 条</span></label>
+        <label class="dropzone" id="dropzone" tabindex="0"><input id="file-input" type="file" accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.mp4,.aiff,.aif" multiple hidden><span class="upload-icon">＋</span><strong>拖入音频，或点击多选</strong><span>MP3 / WAV / M4A / FLAC 等 · 每条最多 200 MB</span></label>
+        <section class="upload-panel" id="upload-panel" hidden aria-labelledby="upload-title">
+          <div class="upload-heading"><strong id="upload-title">导入进度</strong><button type="button" class="batch-link" id="clear-upload-history">清除记录</button></div>
+          <p class="upload-summary" id="upload-summary" role="status" aria-live="polite"></p>
+          <div class="upload-progress-label"><span>总传输进度</span><strong id="upload-percent">0%</strong></div>
+          <div class="upload-progress" id="upload-progress" role="progressbar" aria-label="音频总传输进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+          <p class="upload-bytes" id="upload-bytes"></p>
+          <p class="upload-current" id="upload-current"></p>
+          <p class="upload-help" id="upload-help">可继续添加多条音频，已导入的音频可以先开始检测。</p>
+          <details class="upload-records"><summary>查看导入明细</summary><ul id="upload-record-list"></ul></details>
+          <button type="button" class="button secondary upload-retry" id="retry-uploads" hidden>重试未完成的音频</button>
+        </section>
         <div class="run-settings"><label for="scope-select">评测模式</label><select id="scope-select"><option value="fast">全量快速 · 推荐</option><option value="sample">快速抽样 · 开头与中段 2 分钟</option><option value="full">全量精细 · 1 秒滑窗</option></select><p id="scope-description">约 9 秒一个音质窗口，覆盖全段。基础声学检测始终覆盖全量。</p></div>
         <button class="button primary full" id="run-button" disabled><span class="play-small">▶</span> 批量检测 <span id="pending-count"></span></button>
         <p class="queue-status" id="queue-status" role="status">正在连接检测服务…</p>

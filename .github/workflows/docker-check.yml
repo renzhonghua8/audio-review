@@ -16,21 +16,95 @@ concurrency:
 jobs:
   docker-check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build the deployment image
         run: docker build -t audio-review:ci .
+      - name: Start a separate existing-service fixture
+        run: |
+          set -euo pipefail
+          existing_id="$(docker run -d --name audio-review-ci-existing-service \
+            --init --no-healthcheck --cpus 0.05 --memory 64m --memory-swap 64m \
+            -p 127.0.0.1:9009:9009 --entrypoint python \
+            audio-review:ci -m http.server 9009)"
+          printf 'EXISTING_SERVICE_ID=%s\n' "$existing_id" >> "$GITHUB_ENV"
+          ready=false
+          for attempt in {1..30}; do
+            status="$(curl --silent --max-time 2 --output /dev/null \
+              --write-out '%{http_code}' http://127.0.0.1:9009/)" || status=''
+            if [[ "$status" == 200 ]]; then ready=true; break; fi
+            sleep 1
+          done
+          "$ready" || { docker logs "$existing_id"; exit 1; }
       - name: Start an empty test container
         run: >-
           docker run -d --name audio-review-ci --init
+          -e AUDIO_REVIEW_WORKERS=2 -e AUDIO_REVIEW_MODEL_THREADS=1
           -p 127.0.0.1:8001:8001 audio-review:ci
       - name: Verify the actual local model and API
         run: docker exec audio-review-ci python scripts/smoke-test.py
-      - name: Show logs and clean up the test container
+      - name: Remove the first disposable test container
+        run: |
+          docker logs --tail 100 audio-review-ci
+          docker rm -f audio-review-ci
+      - name: Verify two real model jobs under 768 MiB and 0.5 CPU
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/audio-review-parallel-check"
+          mkdir -p "$report_dir"
+          test "$(docker inspect --format '{{.Id}}' audio-review-ci-existing-service)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          docker run -d --name audio-review-parallel-ci --init --restart no \
+            --cpus 0.5 --cpu-shares 128 --memory 768m --memory-swap 768m --pids-limit 256 \
+            -e AUDIO_REVIEW_WORKERS=2 -e AUDIO_REVIEW_MODEL_THREADS=1 \
+            -p 127.0.0.1:8001:8001 audio-review:ci
+          sudo -n python3 scripts/container-resource-check.py monitor "$report_dir" \
+            --container audio-review-parallel-ci &
+          monitor_pid=$!
+          finish() {
+            result=$?
+            trap - EXIT
+            touch "$report_dir/stop-monitor"
+            wait "$monitor_pid" || true
+            docker logs --tail 200 audio-review-parallel-ci > "$report_dir/container.log" 2>&1 || true
+            exit "$result"
+          }
+          trap finish EXIT
+          PARALLEL_TEST_DISPOSABLE=1 PARALLEL_REPORT_DIR="$report_dir" \
+            PARALLEL_EXISTING_SERVICE_URL=http://127.0.0.1:9009/ \
+            python3 scripts/parallel-smoke-test.py | tee "$report_dir/api.log"
+          touch "$report_dir/stop-monitor"
+          wait "$monitor_pid"
+          python3 scripts/container-resource-check.py verify "$report_dir" | tee "$report_dir/resources.log"
+          test "$(docker inspect --format '{{.Id}}' audio-review-ci-existing-service)" = "$EXISTING_SERVICE_ID"
+          test "$(docker inspect --format '{{.State.Running}}' "$EXISTING_SERVICE_ID")" = true
+          test "$(curl --silent --show-error --max-time 5 --output /dev/null \
+            --write-out '%{http_code}' http://127.0.0.1:9009/)" = 200
+          printf 'Existing service kept the same container ID, stayed running, and served HTTP 200 before, during, and after both rounds.\n' \
+            > "$report_dir/existing-service.log"
+      - name: Save a bounded summary and remove only the CI fixtures
         if: always()
         run: |
+          report_dir="$RUNNER_TEMP/audio-review-parallel-check"
+          mkdir -p "$report_dir"
           docker logs --tail 100 audio-review-ci || true
+          docker logs --tail 200 audio-review-parallel-ci > "$report_dir/container.log" 2>&1 || true
+          if [[ -f "$report_dir/resource-summary.json" ]]; then
+            printf '### Two concurrent real model jobs, 768 MiB, 0.5 CPU, no swap\n\n```json\n' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report_dir/resource-summary.json" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n\nSynthetic fixtures check execution and resource use, not prediction accuracy or all-input safety.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
           docker rm -f audio-review-ci || true
+          docker rm -f audio-review-parallel-ci || true
+          docker rm -f audio-review-ci-existing-service || true
+      - name: Retain resource measurements and API evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parallel-evaluation-768m
+          path: ${{ runner.temp }}/audio-review-parallel-check/
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.3
+VERSION=2.0.4
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -9,7 +9,7 @@ APP_BASE=/opt/audio-review
 DATA_DIR="$APP_BASE/data"
 BACKUP_DIR="$APP_BASE/backups"
 IMAGE_DIR="$APP_BASE/images"
-WORKERS="${AUDIO_REVIEW_WORKERS:-1}"
+WORKERS="${AUDIO_REVIEW_WORKERS:-2}"
 MODEL_THREADS="${AUDIO_REVIEW_MODEL_THREADS:-1}"
 MEMORY_REQUEST="${AUDIO_REVIEW_MEMORY_MB:-auto}"
 HOST_RESERVE_MB=512
@@ -78,8 +78,8 @@ select_memory_budget() {
     MEMORY_MB="$MEMORY_REQUEST"
   fi
   require_memory_budget
-  if [[ "$MEMORY_MB" -lt 1024 && ( "$WORKERS" != 1 || "$MODEL_THREADS" != 1 ) ]]; then
-    fail '768 MiB 模式需要 AUDIO_REVIEW_WORKERS=1、AUDIO_REVIEW_MODEL_THREADS=1；请使用默认线程数。'
+  if [[ "$MEMORY_MB" -lt 1024 && ( "$WORKERS" -gt 2 || "$MODEL_THREADS" != 1 ) ]]; then
+    fail '768 MiB 模式最多同时评测 2 条，且需要 AUDIO_REVIEW_MODEL_THREADS=1；请使用默认线程数。'
   fi
   echo "当前可用内存 ${AVAILABLE_MEMORY_MB} MiB（${MEMORY_SOURCE}）；声检上限 ${MEMORY_MB} MiB；宿主余量要求 ${HOST_RESERVE_MB} MiB。"
 }

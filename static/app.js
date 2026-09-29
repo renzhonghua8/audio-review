@@ -1,6 +1,6 @@
 'use strict';
 const $ = selector => document.querySelector(selector);
-const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, signature: '', health: null, drafts: new Map()};
+const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, signature: '', health: null, drafts: new Map(), imports: {entries: [], running: false, nextId: 1}};
 const ratingFields = [
   ['human_likeness', '像真人播客吗'], ['naturalness', '语音自然度'], ['clarity', '音质清晰度'],
   ['engagement', '愿继续听'], ['voice_distinction', '声音区分度'], ['accent_emotion', '口音情绪合适'],
@@ -60,8 +60,8 @@ function renderQueue() {
   $('#select-all').disabled = !selectable.length;
   const queue = state.queue, workers = queue?.workers || state.health?.workers || 2;
   $('#queue-status').textContent = queue?.active_jobs || queue?.queued_jobs
-    ? `同时运行 ${queue.active_jobs}/${workers} · 排队 ${queue.queued_jobs} 个任务`
-    : `最多同时处理 ${workers} 个文件 · 相同内容只计算一次`;
+    ? `评测任务 ${queue.active_jobs}/${workers} · 排队 ${queue.queued_jobs} 个任务 · 可批量提交多条`
+    : `可批量提交多条 · 同时评测最多 ${workers} 条，其他自动排队`;
   const nextQueueSignature = JSON.stringify([items.map(item => [item.id,item.updated_at]),state.selected,state.blind,[...state.checked]]);
   if (nextQueueSignature === queueSignature) return;
   queueSignature = nextQueueSignature;
@@ -123,9 +123,9 @@ function renderDetail(force = false) {
   if (item.status === 'done' && item.result) {
     content = playerMarkup(item) + qualityMarkup(item.result) + findingsMarkup(item.result) + reviewMarkup(item);
   } else if (busy) {
-    content = `<div class="notice">${escapeHTML(item.stage)}。在${storageLocation()}最多同时处理 ${state.health?.workers || 2} 个文件，可继续导入其他音频。</div><div class="job-progress"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量</p><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>正在分析声音</h3><p>完成后会显示真实音质评分和问题片段。</p></div></div>`;
+    content = `<div class="notice">${escapeHTML(item.stage)}。批量任务会自动排队，在${storageLocation()}最多同时评测 ${state.health?.workers || 2} 条，可继续导入其他音频。</div><div class="job-progress"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量</p><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>正在分析声音</h3><p>完成后会显示真实音质评分和问题片段。</p></div></div>`;
   } else {
-    content = playerMarkup(item) + (item.status === 'error' ? `<div class="notice error">${escapeHTML(item.error || '检测失败，请重试。')}</div>` : '<div class="notice">音频已导入。勾选多条后点击“批量检测”，会按所选模式同时处理文件。</div>') + `<div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${item.status === 'error' ? '可以重新检测这条音频' : '准备开始检测'}</h3><button class="button secondary" id="run-selected">${item.status === 'error' ? '重试检测' : '检测这条音频'}</button></div></div>`;
+    content = playerMarkup(item) + (item.status === 'error' ? `<div class="notice error">${escapeHTML(item.error || '检测失败，请重试。')}</div>` : '<div class="notice">音频已导入。勾选多条后点击“批量检测”，系统会自动处理全部所选音频。</div>') + `<div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${item.status === 'error' ? '可以重新检测这条音频' : '准备开始检测'}</h3><button class="button secondary" id="run-selected">${item.status === 'error' ? '重试检测' : '检测这条音频'}</button></div></div>`;
   }
   $('#detail-panel').innerHTML = `<div class="detail-header"><div class="detail-title-row"><div><div class="eyebrow">02 / ${item.sample_id} · 结果与回听</div><h2>${escapeHTML(displayName(item))}</h2><div class="detail-sub">${escapeHTML(meta)}</div></div><span class="badge ${badgeClass}">${statusNames[item.status]}</span></div>${item.status === 'done' ? '<button class="text-button" id="run-selected">重新检测</button>' : ''}</div><div class="detail-body">${content}</div>`;
   $('#run-selected')?.addEventListener('click', () => runItems([item.id], item.status === 'done'));
@@ -219,19 +219,146 @@ async function refresh(force = false) {
     renderQueue(); renderDetail(force);
   } catch (error) { if (force) notify('检测服务暂时不可用，请确认它正在运行。'); }
 }
-async function uploadFiles(files) {
-  const selected = Array.from(files); if (!selected.length) return;
-  if (selected.length > 20) { notify('每批最多 20 条，请分批导入。'); return; }
-  if (selected.some(file => file.size > 200 * 1024 * 1024)) { notify('单个文件最多 200 MB，请先拆分较大的音频。'); return; }
-  const body = new FormData(); selected.forEach(file => body.append('files', file));
-  state.loading = true; $('#dropzone').classList.add('dragging');
-  $('#dropzone strong').textContent = '正在导入 ' + selected.length + ' 条音频…'; renderQueue();
+const importName = entry => state.blind ? '导入音频 #' + entry.number : entry.name;
+let importRenderFrame;
+function scheduleImportRender() {
+  if (importRenderFrame) return;
+  importRenderFrame = requestAnimationFrame(() => { importRenderFrame = null; renderImports(); });
+}
+function renderImports() {
+  const imports = state.imports, entries = imports.entries;
+  const panel = $('#upload-panel'); panel.hidden = !entries.length;
+  $('#dropzone').classList.toggle('importing', imports.running);
+  $('#dropzone strong').textContent = imports.running ? '继续添加音频，或拖入多条' : '拖入音频，或点击多选';
+  if (!entries.length) return;
+  const done = entries.filter(entry => entry.status === 'done').length;
+  const failed = entries.filter(entry => entry.status === 'error').length;
+  const waiting = entries.filter(entry => entry.status === 'queued').length;
+  const active = entries.find(entry => ['uploading','confirming'].includes(entry.status));
+  const transferable = entries.filter(entry => !entry.invalid);
+  const totalBytes = transferable.reduce((sum, entry) => sum + entry.size, 0);
+  const loadedBytes = transferable.reduce((sum, entry) => sum + entry.loaded, 0);
+  const percentage = totalBytes ? Math.min(100, Math.floor(loadedBytes / totalBytes * 100)) : 0;
+  $('#upload-title').textContent = imports.running ? '正在导入音频' : failed ? '导入完成，有未完成音频' : '导入完成';
+  $('#upload-summary').textContent = `已导入 ${done}/${entries.length} 条${waiting ? ' · 待上传 ' + waiting + ' 条' : ''}${failed ? ' · 未完成 ' + failed + ' 条' : ''}`;
+  $('#upload-percent').textContent = percentage + '%';
+  const progress = $('#upload-progress');
+  progress.firstElementChild.style.width = percentage + '%';
+  progress.classList.toggle('indeterminate', active?.status === 'uploading' && active.progress === null);
+  progress.setAttribute('aria-valuenow', String(percentage));
+  progress.setAttribute('aria-valuetext', `已传输 ${percentage}%，已导入 ${done}/${entries.length} 条${active?.status === 'confirming' ? '，等待服务器确认' : ''}`);
+  $('#upload-bytes').textContent = `已传输 ${fileSize(loadedBytes)} / ${fileSize(totalBytes)}`;
+  $('#upload-current').textContent = active
+    ? active.status === 'confirming'
+      ? `已传输 100%，等待服务器保存并确认：${importName(active)}`
+      : `正在上传第 ${entries.indexOf(active) + 1}/${entries.length} 条：${importName(active)}${active.progress === null ? '' : ' · ' + Math.floor(active.progress * 100) + '%'}`
+    : failed ? '展开导入明细查看原因；其他音频已继续导入。' : '服务器已确认导入，可以勾选多条开始批量检测。';
+  $('#upload-help').textContent = imports.running
+    ? '可继续添加多条音频，已导入的音频可以先开始检测。'
+    : '每条音频单独上传并确认，单条失败不会中断后续导入。';
+  $('#clear-upload-history').disabled = imports.running;
+  const retryable = entries.filter(entry => entry.status === 'error' && !entry.invalid);
+  $('#retry-uploads').hidden = !retryable.length;
+  $('#retry-uploads').textContent = `重试未完成的音频（${retryable.length} 条）`;
+  $('#upload-record-list').innerHTML = entries.map(entry => {
+    const status = entry.status === 'done' ? '已导入'
+      : entry.status === 'confirming' ? '已传输 100% · 等待确认'
+      : entry.status === 'uploading' ? entry.progress === null ? '正在上传' : '上传 ' + Math.floor(entry.progress * 100) + '%'
+      : entry.status === 'error' ? '未完成' : '等待上传';
+    const error = state.blind && entry.error ? entry.error.split(entry.name).join('该音频') : entry.error;
+    return `<li class="upload-record ${entry.status === 'error' ? 'error' : ''}"><div><span class="upload-record-name" title="${escapeHTML(importName(entry))}">${escapeHTML(importName(entry))}</span><span class="upload-record-status">${status}</span></div>${error ? `<p>${escapeHTML(error)}</p>` : ''}</li>`;
+  }).join('');
+}
+function sendUpload(entry) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest(), body = new FormData();
+    body.append('files', entry.file);
+    request.open('POST', '/api/upload');
+    request.responseType = 'json';
+    request.timeout = 30 * 60 * 1000;
+    request.upload.addEventListener('progress', event => {
+      if (event.lengthComputable && event.total > 0) {
+        entry.progress = Math.min(1, event.loaded / event.total);
+        entry.loaded = entry.size * entry.progress;
+        if (entry.progress === 1) entry.status = 'confirming';
+      } else entry.progress = null;
+      scheduleImportRender();
+    });
+    request.upload.addEventListener('load', () => {
+      entry.progress = 1; entry.loaded = entry.size; entry.status = 'confirming'; renderImports();
+    });
+    request.addEventListener('load', () => {
+      const response = request.response;
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(typeof response?.detail === 'string' ? response.detail : `导入请求未完成（HTTP ${request.status}），可稍后重试。`)); return;
+      }
+      if (!Array.isArray(response?.items) || !response.items.length) {
+        reject(new Error('服务器未返回导入记录，请先刷新音频列表确认，再决定是否重试。')); return;
+      }
+      resolve(response);
+    });
+    request.addEventListener('error', () => reject(new Error('连接中断，未收到服务器确认。请先检查音频列表，再重试。')));
+    request.addEventListener('timeout', () => reject(new Error('上传请求超时，未收到服务器确认。请先检查音频列表，再重试。')));
+    request.addEventListener('abort', () => reject(new Error('上传已中断，请先检查音频列表，再重试。')));
+    request.send(body);
+  });
+}
+async function processUploadQueue() {
+  const imports = state.imports;
+  if (imports.running) return;
+  imports.running = true; renderImports();
   try {
-    const response = await api('/api/upload', {method:'POST', body});
-    response.items.forEach(item => state.checked.add(item.id));
-    state.selected = response.items[0].id; await refresh(true); notify('已导入 ' + response.items.length + ' 条音频');
-  } catch (error) { notify(error.message); }
-  finally { state.loading = false; $('#dropzone').classList.remove('dragging'); $('#dropzone strong').textContent = '拖入音频，或点击选择'; $('#file-input').value = ''; renderQueue(); }
+    let entry;
+    // One request at a time bounds server upload pressure and isolates each file's failure.
+    while ((entry = imports.entries.find(item => item.status === 'queued'))) {
+      entry.status = 'uploading'; entry.progress = 0; entry.loaded = 0; entry.error = ''; renderImports();
+      try {
+        const response = await sendUpload(entry);
+        entry.status = 'done'; entry.progress = 1; entry.loaded = entry.size; entry.file = null;
+        // Discard a list request started before this upload was committed.
+        refreshVersion += 1;
+        for (const item of response.items) {
+          const index = state.items.findIndex(existing => existing.id === item.id);
+          if (index >= 0) state.items[index] = item; else state.items.push(item);
+          state.checked.add(item.id);
+        }
+        if (!state.selected) state.selected = response.items[0].id;
+        renderQueue(); renderDetail();
+      } catch (error) {
+        entry.status = 'error'; entry.error = error.message || '导入未完成，请稍后重试。';
+      }
+      renderImports();
+    }
+  } finally {
+    imports.running = false; renderImports(); renderQueue();
+    const done = imports.entries.filter(entry => entry.status === 'done').length;
+    const failed = imports.entries.filter(entry => entry.status === 'error').length;
+    notify(`已导入 ${done} 条音频${failed ? '，' + failed + ' 条未完成，请查看导入明细' : '，可以批量检测'}`);
+  }
+}
+function uploadFiles(files) {
+  const selected = Array.from(files); if (!selected.length) return;
+  const imports = state.imports;
+  if (!imports.running && imports.entries.every(entry => entry.status === 'done')) imports.entries = [];
+  const allowed = $('#file-input').accept.toLowerCase().split(',');
+  for (const file of selected) {
+    const suffix = file.name.includes('.') ? '.' + file.name.split('.').pop().toLowerCase() : '';
+    const error = !allowed.includes(suffix) ? '不支持此格式，请选择 MP3、WAV、M4A、FLAC 等音频文件。'
+      : file.size > 200 * 1024 * 1024 ? '超过单条 200 MB 限制，请先拆分音频。'
+      : file.size === 0 ? '文件为空，请重新选择有效音频。' : '';
+    imports.entries.push({number:imports.nextId++, file, name:file.name, size:file.size, loaded:0, progress:0, status:error ? 'error' : 'queued', invalid:!!error, error});
+  }
+  $('#dropzone').classList.remove('dragging');
+  renderImports(); processUploadQueue();
+}
+function retryUploads() {
+  const imports = state.imports;
+  const retries = imports.entries.filter(entry => entry.status === 'error' && !entry.invalid);
+  if (!retries.length) return;
+  for (const entry of retries) { entry.status = 'queued'; entry.error = ''; entry.loaded = 0; entry.progress = 0; }
+  const retried = new Set(retries);
+  imports.entries = imports.entries.filter(entry => !retried.has(entry)).concat(retries);
+  renderImports(); processUploadQueue();
 }
 async function runItems(ids, force = false) {
   if (state.loading || !ids.length) return;
@@ -261,18 +388,20 @@ async function saveHumanReview(event) {
   } catch (error) { notify(error.message); $('#save-review').disabled = false; }
 }
 $('#blind-toggle').checked = state.blind;
-$('#blind-toggle').addEventListener('change', event => { state.blind = event.target.checked; localStorage.setItem('audio-review-blind', String(state.blind)); renderQueue(); renderDetail(true); });
+$('#blind-toggle').addEventListener('change', event => { state.blind = event.target.checked; localStorage.setItem('audio-review-blind', String(state.blind)); renderQueue(); renderDetail(true); renderImports(); });
 $('#audio-list').addEventListener('click', event => { const button = event.target.closest('[data-select]'); if (button) { state.selected = button.dataset.select; renderQueue(); refresh(true); } });
 $('#audio-list').addEventListener('change', event => { const input = event.target.closest('[data-check]'); if (input) { input.checked ? state.checked.add(input.dataset.check) : state.checked.delete(input.dataset.check); renderQueue(); } });
 $('#select-all').addEventListener('change', event => { state.items.filter(eligible).forEach(item => event.target.checked ? state.checked.add(item.id) : state.checked.delete(item.id)); renderQueue(); });
 $('#select-pending').addEventListener('click', () => { state.checked = new Set(state.items.filter(item => ['uploaded','error'].includes(item.status)).map(item => item.id)); renderQueue(); });
 $('#clear-selection').addEventListener('click', () => { state.checked.clear(); renderQueue(); });
 $('#scope-select').addEventListener('change', () => { $('#scope-description').textContent = scopeDescriptions[$('#scope-select').value]; });
-$('#file-input').addEventListener('change', event => uploadFiles(event.target.files));
+$('#file-input').addEventListener('change', event => { const files = Array.from(event.target.files); event.target.value = ''; uploadFiles(files); });
 $('#dropzone').addEventListener('keydown', event => { if (['Enter',' '].includes(event.key)) { event.preventDefault(); $('#file-input').click(); } });
 $('#dropzone').addEventListener('dragover', event => { event.preventDefault(); $('#dropzone').classList.add('dragging'); });
-$('#dropzone').addEventListener('dragleave', () => { if (!state.loading) $('#dropzone').classList.remove('dragging'); });
+$('#dropzone').addEventListener('dragleave', () => $('#dropzone').classList.remove('dragging'));
 $('#dropzone').addEventListener('drop', event => { event.preventDefault(); uploadFiles(event.dataTransfer.files); });
+$('#retry-uploads').addEventListener('click', retryUploads);
+$('#clear-upload-history').addEventListener('click', () => { if (!state.imports.running) { state.imports.entries = []; renderImports(); } });
 $('#run-button').addEventListener('click', () => runItems(batchItems().map(item => item.id)));
 $('#refresh-button').addEventListener('click', () => refresh(true));
 $('#export-button').addEventListener('click', () => { const link = document.createElement('a'); link.href = '/api/export.csv?blind=' + state.blind; link.download = '音频评测评分表.csv'; document.body.appendChild(link); link.click(); link.remove(); });

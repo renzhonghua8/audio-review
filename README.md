@@ -9,15 +9,16 @@
 3. 导入音频，选择评测模式，勾选多条音频，点击 **批量检测**。
 4. 在结果页点击时间标记回听，填写人工评分，再导出 CSV 评分表。
 
-每次最多导入 20 条，单条最多 200 MB、时长小于 4 小时。支持 MP3、WAV、M4A、FLAC、OGG、AAC、OPUS、MP4 音轨和 AIFF。浏览器不支持播放的格式，可换用 MP3/WAV 进行回听。
+支持一次多选或拖入多条音频，并在导入期间继续追加；逐条上传，显示真实传输百分比、大小和服务器确认状态，单条失败继续后续文件。单条最多 200 MB、时长小于 4 小时。支持 MP3、WAV、M4A、FLAC、OGG、AAC、OPUS、MP4 音轨和 AIFF。浏览器不支持播放的格式，可换用 MP3/WAV 进行回听。
 
 ## CentOS Docker 部署
 
-代码仓库：[renzhonghua8/audio-review](https://github.com/renzhonghua8/audio-review)。服务器版采用 **8001** 端口，可下载 GitHub 预构建镜像，不在已有服务的宿主上构建。默认独立容器、0.5 核 CPU / 自动选择 768 或 1024 MiB 内存（另需 512 MiB 宿主余量）、逐条批量处理；检测端口和容器名冲突，自动识别实际网卡 IP，不重启 Docker 或修改其他服务配置。完整命令及资源边界见 [Docker 部署说明](Docker部署说明.md)。模型随镜像提供。
+代码仓库：[renzhonghua8/audio-review](https://github.com/renzhonghua8/audio-review)。服务器版采用 **8001** 端口，可下载 GitHub 预构建镜像，不在已有服务的宿主上构建。默认独立容器、0.5 核 CPU / 自动选择 768 或 1024 MiB 内存（另需 512 MiB 宿主余量）、最多同时评测 2 条、其余排队；检测端口和容器名冲突，自动识别实际网卡 IP，不重启 Docker 或修改其他服务配置。完整命令及资源边界见 [Docker 部署说明](Docker部署说明.md)。模型随镜像提供。
 
 ## 已实现
 
-- 批量导入、勾选/全选检测、默认同时处理 2 个不同文件，进度显示及失败重试。
+- 多文件导入队列、真实上传进度、逐条确认、失败明细及重试；导入期间可追加文件，也可先检测已导入音频。
+- 勾选/全选批量检测、默认同时评测 2 个不同文件，单独显示进度，其余自动排队。
 - 默认全量快速模式；另有快速抽样和全量精细模式。
 - 相同音频内容、模式和评测版本复用自动结果，人工评分保持独立。
 - 单次解码同时生成原始声学与模型支路；网页只获取当前音频的完整片段数据。
@@ -51,7 +52,7 @@ DNSMOS 输出是质量预测值，不代表真人或 AI 来源，也不等同于
 
 搬到其他目录时，启动程序默认在项目内的 `work` 创建运行环境和数据。首次安装 Python 依赖需要网络，安装好后可离线运行。服务仅监听 `127.0.0.1`，无需账号。
 
-开发运行：Python 3.12+，安装 `requirements.lock.txt`，然后执行 `python app.py --install-model` 和 `python app.py`。可用 `AUDIO_REVIEW_DATA_DIR` 指定数据目录，`AUDIO_REVIEW_PYTHON` 指定启动所用 Python。`AUDIO_REVIEW_WORKERS` 控制同时处理的文件数，`AUDIO_REVIEW_MODEL_THREADS` 控制音质模型线程数，均默认 2、允许 1–8；始终只使用一个 Web 服务进程。
+开发运行：Python 3.12+，安装 `requirements.lock.txt`，然后执行 `python app.py --install-model` 和 `python app.py`。可用 `AUDIO_REVIEW_DATA_DIR` 指定数据目录，`AUDIO_REVIEW_PYTHON` 指定启动所用 Python。`AUDIO_REVIEW_WORKERS` 控制同时处理的文件数，`AUDIO_REVIEW_MODEL_THREADS` 控制音质模型线程数，本地默认均为 2、允许 1–8；Docker 默认 2 个评测任务、1 个模型线程。768 MiB 部署最多 2 个任务，模型线程固定为 1；始终只使用一个 Web 服务进程。
 
 ## 来源与许可
 
