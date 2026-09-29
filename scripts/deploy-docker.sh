@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.1
+VERSION=2.0.2
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -78,7 +78,7 @@ check_port() {
       fail "8001 端口已被容器 ${name} 占用，部署已停止，该容器保持运行。"
     fi
   done
-  listeners="$(ss -H -ltn | awk '$4 ~ /:8001$/ { print $4 }')"
+  listeners="$(ss -ltn | awk '$4 ~ /:8001$/ { print $4 }')"
   for listener in $listeners; do
     case " $owned_bindings " in
       *" $listener "*) ;;
