@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=2.0.8
+VERSION=2.0.9
 IMAGE="audio-review:$VERSION"
 CONTAINER=audio-review
 MANAGED_LABEL=io.github.renzhonghua8.audio-review.managed
@@ -11,6 +11,7 @@ BACKUP_DIR="$APP_BASE/backups"
 IMAGE_DIR="$APP_BASE/images"
 WORKERS="${AUDIO_REVIEW_WORKERS:-2}"
 MODEL_THREADS="${AUDIO_REVIEW_MODEL_THREADS:-1}"
+PLAYBACK_CACHE_MB="${AUDIO_REVIEW_PLAYBACK_CACHE_MB:-1024}"
 MEMORY_REQUEST="${AUDIO_REVIEW_MEMORY_MB:-auto}"
 HOST_RESERVE_MB=512
 MEMORY_MB=''
@@ -46,6 +47,8 @@ case "$MEMORY_REQUEST" in
   auto|768|1024) ;;
   *) fail 'AUDIO_REVIEW_MEMORY_MB 仅支持 auto、768 或 1024（MiB）。' ;;
 esac
+[[ "$PLAYBACK_CACHE_MB" =~ ^[1-9][0-9]{2,4}$ ]] && [[ "$PLAYBACK_CACHE_MB" -ge 512 && "$PLAYBACK_CACHE_MB" -le 16384 ]] ||
+  fail 'AUDIO_REVIEW_PLAYBACK_CACHE_MB 必须是 512 到 16384 的整数（MiB）。'
 
 read_available_memory() {
   local memory_info
@@ -344,6 +347,7 @@ new_container="$(docker run -d \
   -e "AUDIO_REVIEW_ALLOWED_ORIGINS=$ORIGINS" \
   -e "AUDIO_REVIEW_WORKERS=$WORKERS" \
   -e "AUDIO_REVIEW_MODEL_THREADS=$MODEL_THREADS" \
+  -e "AUDIO_REVIEW_PLAYBACK_CACHE_MB=$PLAYBACK_CACHE_MB" \
   -v "$DATA_DIR:/data:Z" \
   --log-opt max-size=10m --log-opt max-file=3 \
   "$IMAGE")"
@@ -362,6 +366,7 @@ sys.exit(0 if result.get("ready") and result.get("evaluator_version") == "2.0" e
     echo "部署完成：http://${SERVER_IP}:8001/"
     echo "资源上限：0.5 核 CPU、${MEMORY_MB} MiB 内存；不使用交换空间。"
     echo "音频和评分：${DATA_DIR}；同时评测文件数：${WORKERS}"
+    echo "回听缓存：${PLAYBACK_CACHE_MB} MiB；已保存副本保留，满额后停止生成新副本。"
     exit 0
   fi
   sleep 2

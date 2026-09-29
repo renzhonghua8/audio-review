@@ -1,6 +1,7 @@
 'use strict';
 const $ = selector => document.querySelector(selector);
-const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, taskControlLoading: false, signature: '', health: null, drafts: new Map(), playbacks: new Map(), imports: {entries: [], running: false, nextId: 1}};
+const state = {items: [], selected: null, checked: new Set(), queue: null, blind: localStorage.getItem('audio-review-blind') === 'true', loading: false, taskControlLoading: false, deleteLoading: false, signature: '', health: null, drafts: new Map(), imports: {entries: [], running: false, nextId: 1}};
+const emptyDetailMarkup = $('#detail-panel').innerHTML;
 const ratingFields = [
   ['human_likeness', '像真人播客吗'], ['naturalness', '语音自然度'], ['clarity', '音质清晰度'],
   ['engagement', '愿继续听'], ['voice_distinction', '声音区分度'], ['accent_emotion', '口音情绪合适'],
@@ -8,6 +9,8 @@ const ratingFields = [
 const statusNames = {uploaded: '等待检测', queued: '已加入队列', processing: '检测中', pausing: '正在暂停', paused: '已暂停', done: '检测完成', error: '检测失败'};
 const storageLocation = () => state.health?.local_only === false ? '服务器' : '本机';
 const scopeNames = {fast: '全量快速', sample: '快速抽样', full: '全量精细'};
+const currentScope = () => $('#scope-select').value;
+const resumeChangesScope = item => !!state.health?.resume_scope && item.scope !== currentScope();
 const resultScope = quality => quality.scope === 'sample' && (quality.target_hop_seconds ?? quality.hop_seconds) === 1 ? '抽样精细' : scopeNames[quality.scope];
 const scopeDescriptions = {
   fast: '约 9 秒一个音质窗口，覆盖全段。基础声学检测始终覆盖全量。',
@@ -37,13 +40,21 @@ function notify(message) {
   clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove('visible'), 4200);
 }
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
-  if (!response.ok) {
-    let message = '操作未完成，请稍后再试。';
-    try { const data = await response.json(); if (typeof data.detail === 'string') message = data.detail; else if (typeof data.message === 'string') message = data.message; } catch (_) {}
-    throw new Error(message);
-  }
-  return response.json();
+  const controller = new AbortController(), abort = () => controller.abort();
+  options.signal?.addEventListener('abort', abort, {once:true});
+  if (options.signal?.aborted) abort();
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; abort(); }, 60000);
+  try {
+    const response = await fetch(path, {...options, signal:controller.signal});
+    if (!response.ok) {
+      let message = '操作未完成，请稍后再试。';
+      try { const data = await response.json(); if (typeof data.detail === 'string') message = data.detail; else if (typeof data.message === 'string') message = data.message; } catch (_) {}
+      throw new Error(message);
+    }
+    return await response.json();
+  } catch (error) { if (expired) throw new Error('服务响应超时，请刷新确认任务状态后再试。'); throw error; }
+  finally { clearTimeout(timer); options.signal?.removeEventListener('abort', abort); }
 }
 function displayName(item) { return state.blind ? item.sample_id + ' · 盲听样本' : item.filename; }
 function renderQueue() {
@@ -53,7 +64,7 @@ function renderQueue() {
   $('#flagged-count').textContent = items.filter(item => item.status === 'done' && item.result?.metrics.findings.length).length;
   $('#reviewed-count').textContent = items.filter(item => item.review.complete).length;
   const pending = batchItems();
-  $('#run-button').disabled = !pending.length || state.loading || !state.health?.ready;
+  $('#run-button').disabled = !pending.length || state.loading || state.deleteLoading || !state.health?.ready;
   $('#pending-count').textContent = pending.length ? '（' + pending.length + ' 条）' : '';
   $('#export-button').disabled = !items.length;
   $('#queue-label').textContent = items.length ? '音频列表 · ' + items.length : '音频列表';
@@ -62,26 +73,33 @@ function renderQueue() {
   $('#select-all').checked = selectable.length > 0 && checked.length === selectable.length;
   $('#select-all').indeterminate = checked.length > 0 && checked.length < selectable.length;
   $('#select-all').disabled = !selectable.length;
+  $('#delete-selected').disabled = !checked.length || state.deleteLoading || state.taskControlLoading || state.loading || !state.health?.audio_delete;
+  $('#delete-selected').textContent = state.deleteLoading ? '正在删除…' : '删除所选' + (checked.length ? '（' + checked.length + '）' : '');
   for (const action of ['pause','resume']) {
-    const count = taskItems(action).length, button = $('#' + action + '-tasks');
-    button.disabled = state.taskControlLoading || !count || !state.health?.task_pause;
-    button.textContent = (action === 'pause' ? '暂停' : '继续') + (state.checked.size ? '所选' : '全部') + (count ? '（' + count + '）' : '');
+    const tasks = taskItems(action), count = tasks.length, button = $('#' + action + '-tasks');
+    button.disabled = state.taskControlLoading || state.deleteLoading || !count || !state.health?.task_pause;
+    button.textContent = (action === 'pause' ? '暂停' : tasks.some(resumeChangesScope) ? '按新模式继续' : '继续') + (state.checked.size ? '所选' : '全部') + (count ? '（' + count + '）' : '');
   }
+  const changing = taskItems('resume').filter(resumeChangesScope).length;
+  $('#task-control-help').textContent = state.health?.resume_scope
+    ? `继续使用「${scopeNames[currentScope()]}」：模式相同接着检测，切换模式从头检测${changing ? `（${changing} 条将切换）` : ''}。勾选操作部分任务；未勾选操作全部。`
+    : '勾选可暂停或继续部分任务；未勾选时操作全部。暂停后保留进度。';
   const queue = state.queue, workers = queue?.workers || state.health?.workers || 2;
   const paused = (queue?.paused_files ?? queue?.paused_jobs ?? 0) + (queue?.pausing_files ?? queue?.pausing_jobs ?? 0);
   $('#queue-status').textContent = (queue?.active_jobs || queue?.queued_jobs
     ? `评测任务 ${queue.active_jobs}/${workers} · 排队 ${queue.queued_jobs} 个任务 · 可批量提交多条`
     : `可批量提交多条 · 同时评测最多 ${workers} 条，其他自动排队`) + (paused ? ` · 暂停 ${paused} 条` : '');
-  const nextQueueSignature = JSON.stringify([items.map(item => [item.id,item.updated_at]),state.selected,state.blind,[...state.checked],state.taskControlLoading]);
+  const nextQueueSignature = JSON.stringify([items.map(item => [item.id,item.updated_at]),state.selected,state.blind,[...state.checked],state.loading,state.taskControlLoading,state.deleteLoading,currentScope(),state.health?.audio_delete,state.health?.resume_scope]);
   if (nextQueueSignature === queueSignature) return;
   queueSignature = nextQueueSignature;
   $('#audio-list').innerHTML = items.length ? items.map(item => {
     const score = item.status === 'done' ? item.result?.quality.overall : null;
     const busy = ['queued','processing','pausing','paused'].includes(item.status);
     const action = ['queued','processing'].includes(item.status) ? 'pause' : ['paused','pausing'].includes(item.status) ? 'resume' : null;
-    const label = action === 'pause' ? '暂停' : '继续';
-    const control = action ? `<button type="button" class="task-item-action" data-task-action="${action}" data-task-id="${item.id}" aria-label="${label} ${escapeHTML(displayName(item))}" ${state.taskControlLoading || !state.health?.task_pause ? 'disabled' : ''}>${label}</button>` : '';
-    return `<div class="audio-row"><label class="batch-check"><input type="checkbox" data-check="${item.id}" aria-label="选择 ${escapeHTML(displayName(item))}" ${state.checked.has(item.id) ? 'checked' : ''}></label><button class="audio-item ${item.id === state.selected ? 'selected' : ''}" data-select="${item.id}" aria-label="查看 ${escapeHTML(displayName(item))}"><span class="audio-index">${item.sample_id}</span><span class="audio-item-info"><span class="audio-name">${escapeHTML(displayName(item))}</span><span class="audio-meta"><span class="status ${escapeHTML(item.status)}">${busy ? escapeHTML(item.stage) : item.result?.processing?.cache_hit ? '已复用结果' : statusNames[item.status]}</span><span>·</span><span>${item.result ? formatTime(item.result.metrics.duration) : fileSize(item.size)}</span>${item.review.complete ? '<span>· 已评分</span>' : ''}</span>${busy ? `<span class="item-progress ${item.status === 'paused' ? 'paused' : ''}"><span style="width:${item.progress}%"></span></span>` : ''}</span>${score != null ? `<span class="audio-score">${scoreText(score)}</span>` : ''}</button>${control}</div>`;
+    const label = action === 'pause' ? '暂停' : resumeChangesScope(item) ? '换模式继续' : '继续';
+    const control = action ? `<button type="button" class="task-item-action" data-task-action="${action}" data-task-id="${item.id}" aria-label="${label} ${escapeHTML(displayName(item))}" ${state.taskControlLoading || state.deleteLoading || !state.health?.task_pause ? 'disabled' : ''}>${label}</button>` : '';
+    const deletion = `<button type="button" class="task-item-action delete-action" data-delete="${item.id}" aria-label="删除 ${escapeHTML(displayName(item))}" ${state.deleteLoading || state.taskControlLoading || state.loading || !state.health?.audio_delete ? 'disabled' : ''}>删除</button>`;
+    return `<div class="audio-row"><label class="batch-check"><input type="checkbox" data-check="${item.id}" aria-label="选择 ${escapeHTML(displayName(item))}" ${state.checked.has(item.id) ? 'checked' : ''}></label><button class="audio-item ${item.id === state.selected ? 'selected' : ''}" data-select="${item.id}" aria-label="查看 ${escapeHTML(displayName(item))}"><span class="audio-index">${item.sample_id}</span><span class="audio-item-info"><span class="audio-name">${escapeHTML(displayName(item))}</span><span class="audio-meta"><span class="status ${escapeHTML(item.status)}">${busy ? escapeHTML(item.stage) : item.result?.processing?.cache_hit ? '已复用结果' : statusNames[item.status]}</span><span>·</span><span>${item.result ? formatTime(item.result.metrics.duration) : fileSize(item.size)}</span>${item.review.complete ? '<span>· 已评分</span>' : ''}</span>${busy ? `<span class="item-progress ${item.status === 'paused' ? 'paused' : ''}"><span style="width:${item.progress}%"></span></span>` : ''}</span>${score != null ? `<span class="audio-score">${scoreText(score)}</span>` : ''}</button><div class="audio-row-actions">${control}${deletion}</div></div>`;
   }).join('') : '<div class="empty-queue"><span class="mini-wave">▂ ▆ █ ▄ ▂</span><p>导入音频后，在这里查看进度。</p></div>';
 }
 function selectedItem() { return state.items.find(item => item.id === state.selected); }
@@ -118,9 +136,9 @@ function reviewMarkup(item) {
 }
 function renderDetail(force = false) {
   const item = selectedItem();
-  if (!item) return;
+  if (!item) { clearDetail(); return; }
   if (item.status === 'done' && item.result && !Array.isArray(item.result.quality.windows)) return;
-  const signature = JSON.stringify([item.id, item.updated_at, state.blind]);
+  const signature = JSON.stringify([item.id, item.updated_at, state.blind, state.loading, state.taskControlLoading, state.deleteLoading, ['paused','pausing'].includes(item.status) ? currentScope() : null]);
   if (!force && signature === state.signature) return;
   const previousId = $('#detail-panel').dataset.audioId;
   const previousForm = $('#review-form'), previousPlayer = $('#audio-player');
@@ -128,11 +146,13 @@ function renderDetail(force = false) {
     if (previousForm.dataset.dirty === 'true') state.drafts.set(previousId, Object.fromEntries(new FormData(previousForm)));
     else state.drafts.delete(previousId);
   }
-  const playback = previousId === item.id && previousPlayer ? {time:previousPlayer.currentTime, rate:previousPlayer.playbackRate, paused:previousPlayer.paused} : null;
-  previousPlayer?.pause();
+  if (previousId && previousPlayer && (previousPlayer.readyState >= 1 || !playbackPositions.has(previousId))) playbackPositions.set(previousId, {time:previousPlayer.currentTime, rate:previousPlayer.playbackRate, paused:previousPlayer.paused});
+  const playback = previousId === item.id && previousPlayer ? playbackPositions.get(item.id)
+    : playbackPositions.has(item.id) ? {...playbackPositions.get(item.id), paused:true} : null;
+  if (previousId !== item.id || ['queued','processing','pausing','paused'].includes(item.status)) previousPlayer?.pause();
   state.signature = signature;
   const busy = ['queued','processing','pausing','paused'].includes(item.status);
-  const suspended = ['paused','pausing'].includes(item.status);
+  const suspended = ['paused','pausing'].includes(item.status), changingScope = suspended && resumeChangesScope(item);
   const meta = busy ? `${fileSize(item.size)} · ${scopeNames[item.scope]}` : item.result ? `${formatTime(item.result.metrics.duration)} · ${fileSize(item.size)} · ${resultScope(item.result.quality)}` : `${fileSize(item.size)} · ${statusNames[item.status]}`;
   const badgeClass = item.status === 'done' ? '' : item.status === 'error' || suspended ? 'amber' : 'neutral';
   let content;
@@ -140,24 +160,28 @@ function renderDetail(force = false) {
     content = playerMarkup(item) + qualityMarkup(item.result) + findingsMarkup(item.result) + reviewMarkup(item);
   } else if (busy) {
     const completed = item.task?.processed_windows || 0, total = item.task?.total_windows || 0;
-    content = `<div class="notice">${escapeHTML(item.stage)}。${suspended ? '已完成的进度保留，点击继续可恢复评测。' : `批量任务会自动排队，在${storageLocation()}最多同时评测 ${state.health?.workers || 2} 条，可继续导入其他音频。`}</div><div class="job-progress ${suspended ? 'paused' : ''}"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量${total ? `<br>已处理 ${completed} / ${total} 个评分窗口` : ''}</p><div class="task-detail-actions"><button type="button" class="button secondary" id="${suspended ? 'resume' : 'pause'}-selected" ${state.taskControlLoading || !state.health?.task_pause ? 'disabled' : ''}>${suspended ? '继续评测' : '暂停这条任务'}</button></div><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${suspended ? item.status === 'pausing' ? '正在暂停评测' : '评测已暂停' : '正在分析声音'}</h3><p>${suspended ? '原音频和人工评分保留，其他未暂停任务可继续。' : '完成后会显示真实音质评分和问题片段。'}</p></div></div>`;
+    content = `<div class="notice">${escapeHTML(item.stage)}。${suspended ? changingScope ? `继续后改用「${scopeNames[currentScope()]}」，旧模式停止，评分进度从头开始。原音频和人工评分保留。` : '已完成的进度保留，点击继续可恢复评测。' : `批量任务会自动排队，在${storageLocation()}最多同时评测 ${state.health?.workers || 2} 条，可继续导入其他音频。`}</div><div class="job-progress ${suspended ? 'paused' : ''}"><span style="width:${item.progress}%"></span></div><p class="scope-pill">${item.progress}% · ${scopeNames[item.scope]} · 基础检测覆盖全量${total ? `<br>已处理 ${completed} / ${total} 个评分窗口` : ''}</p><div class="task-detail-actions"><button type="button" class="button secondary" id="${suspended ? 'resume' : 'pause'}-selected" ${state.taskControlLoading || state.deleteLoading || !state.health?.task_pause ? 'disabled' : ''}>${suspended ? changingScope ? '按新模式继续评测' : '继续评测' : '暂停这条任务'}</button></div><div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${suspended ? item.status === 'pausing' ? '正在暂停评测' : '评测已暂停' : '正在分析声音'}</h3><p>${suspended ? '原音频和人工评分保留，其他未暂停任务可继续。' : '完成后会显示真实音质评分和问题片段。'}</p></div></div>`;
   } else {
     content = playerMarkup(item) + (item.status === 'error' ? `<div class="notice error">${escapeHTML(item.error || '检测失败，请重试。')}</div>` : '<div class="notice">音频已导入。勾选多条后点击“批量检测”，系统会自动处理全部所选音频。</div>') + `<div class="detail-placeholder"><div><span class="mini-wave">▂ ▆ █ ▄ ▂</span><h3>${item.status === 'error' ? '可以重新检测这条音频' : '准备开始检测'}</h3><button class="button secondary" id="run-selected">${item.status === 'error' ? '重试检测' : '检测这条音频'}</button></div></div>`;
   }
-  $('#detail-panel').innerHTML = `<div class="detail-header"><div class="detail-title-row"><div><div class="eyebrow">02 / ${item.sample_id} · 结果与回听</div><h2>${escapeHTML(displayName(item))}</h2><div class="detail-sub">${escapeHTML(meta)}</div></div><span class="badge ${badgeClass}">${statusNames[item.status]}</span></div>${item.status === 'done' ? '<button class="text-button" id="run-selected">重新检测</button>' : ''}</div><div class="detail-body">${content}</div>`;
+  $('#detail-panel').innerHTML = `<div class="detail-header"><div class="detail-title-row"><div><div class="eyebrow">02 / ${item.sample_id} · 结果与回听</div><h2>${escapeHTML(displayName(item))}</h2><div class="detail-sub">${escapeHTML(meta)}</div></div><span class="badge ${badgeClass}">${statusNames[item.status]}</span></div><div class="detail-record-actions">${item.status === 'done' ? '<button class="text-button" id="run-selected">重新检测</button>' : ''}<button type="button" class="text-button delete-action" id="delete-audio" ${state.deleteLoading || state.taskControlLoading || state.loading || !state.health?.audio_delete ? 'disabled' : ''}>删除音频</button></div></div><div class="detail-body">${content}</div>`;
   $('#run-selected')?.addEventListener('click', () => runItems([item.id], item.status === 'done'));
   $('#pause-selected')?.addEventListener('click', () => controlTasks('pause', [item.id]));
   $('#resume-selected')?.addEventListener('click', () => controlTasks('resume', [item.id]));
+  $('#delete-audio')?.addEventListener('click', () => deleteItems([item.id]));
   $('#review-form')?.addEventListener('submit', saveHumanReview);
   $('#detail-panel').dataset.audioId = item.id;
   const draft = state.drafts.get(item.id), form = $('#review-form');
   if (form) {
+    form.dataset.audioId = item.id;
     for (const event of ['input','change']) form.addEventListener(event, () => { form.dataset.dirty = 'true'; });
     if (draft) {
       for (const [name,value] of Object.entries(draft)) { const field = form.elements.namedItem(name); if (field) field.value = value; }
       form.dataset.dirty = 'true';
     }
   }
+  const freshPlayer = $('#audio-player');
+  if (previousId === item.id && previousPlayer && freshPlayer) freshPlayer.replaceWith(previousPlayer);
   setupPlayer(item);
   const player = $('#audio-player');
   if (playback && player) {
@@ -166,135 +190,67 @@ function renderDetail(force = false) {
       player.playbackRate = playback.rate; $('#playback-speed').value = String(playback.rate);
       if (!playback.paused) player.play().catch(() => {});
     };
-    if (player.readyState >= 1) restore(); else player.addEventListener('loadedmetadata', restore, {once:true});
+    if (player.readyState >= 1) restore(); else player.addEventListener('loadedmetadata', restore, {once:true, signal:playerEventController.signal});
   }
 }
-let resizeObserver, playbackPollTimer, playbackGeneration = 0, playbackFetchController, playbackBlob;
+let resizeObserver, playbackGeneration = 0, playbackUnsubscribe, playerEventController;
+const playbackPositions = new Map();
+function clearDetail() {
+  const panel = $('#detail-panel');
+  if (!panel.dataset.audioId) return;
+  $('#audio-player')?.pause();
+  playbackGeneration++; playbackUnsubscribe?.(); playbackUnsubscribe = null;
+  playerEventController?.abort(); resizeObserver?.disconnect(); resizeObserver = null;
+  window.audioPlaybackCache.setActive(null);
+  delete panel.dataset.audioId; state.signature = ''; panel.innerHTML = emptyDetailMarkup;
+}
 function setupCompatiblePlayback(item, player, generation) {
   const current = () => generation === playbackGeneration && player.isConnected && state.selected === item.id;
-  let fallbackAttempted = playbackBlob?.id === item.id;
-  let fallbackLoading = false;
+  const cache = window.audioPlaybackCache;
+  const retry = $('#playback-retry');
   const renderStatus = status => {
     if (!current()) return;
-    if (fallbackLoading && !['loading','error'].includes(status.state)) return;
-    const label = $('#playback-status'), progress = $('#playback-progress'), retry = $('#playback-retry');
-    if (!label || !progress || !retry) return;
-    const phase = status.state;
+    const label = $('#playback-status'), progress = $('#playback-progress');
+    if (!label || !progress) return;
     let text = status.message || '正在准备兼容回听…';
-    if (phase === 'ready') {
-      text = '兼容回听已就绪 · 自动评分使用原音频';
-      const source = playbackBlob?.id === item.id ? playbackBlob.url : status.stream_url;
-      if (source && (player.dataset.source !== source || player.error)) {
-        if (player.error && !source.startsWith('blob:')) fallbackAttempted = false;
-        player.dataset.source = source;
-        player.src = source; player.load();
-      }
-    } else if (phase === 'converting') {
-      text = Number.isFinite(status.progress) ? `正在准备回听 ${Math.floor(status.progress)}%`
-        : `正在准备回听${Number.isFinite(status.prepared_seconds) ? ' · 已处理 ' + formatTime(status.prepared_seconds) : '…'}`;
+    if (status.state === 'ready' && status.url && player.dataset.source !== status.url) {
+      player.dataset.source = status.url; player.src = status.url; player.load();
+    } else if (status.state === 'converting') {
+      text = Number.isFinite(status.progress) ? `首次准备回听 ${Math.floor(status.progress)}%`
+        : `首次准备回听${Number.isFinite(status.prepared_seconds) ? ' · 已处理 ' + formatTime(status.prepared_seconds) : '…'}`;
     }
     label.textContent = text;
-    retry.hidden = phase !== 'error';
-    progress.hidden = !['converting','loading'].includes(phase) || !Number.isFinite(status.progress);
+    retry.hidden = status.state !== 'error';
+    progress.hidden = !['converting','loading'].includes(status.state) || !Number.isFinite(status.progress);
     progress.firstElementChild.style.width = Math.max(0, Math.min(100, status.progress || 0)) + '%';
   };
-  const fail = error => renderStatus({state:'error', message:error.message || '回听暂时未就绪，请重试。'});
-  const loadWithoutRanges = async () => {
-    fallbackAttempted = true; fallbackLoading = true;
-    clearTimeout(playbackPollTimer);
-    const controller = new AbortController(); playbackFetchController = controller;
-    const chunks = [];
-    try {
-      renderStatus({state:'loading', message:'正在加载兼容回听…', progress:null});
-      // A regular GET also works when a server or network drops media Range requests.
-      const response = await fetch('/api/playback/' + item.id + '/audio', {signal:controller.signal});
-      if (!response.ok || response.status !== 200) throw new Error('回听文件暂时无法读取，请重试。');
-      const limit = 512 * 1024 * 1024, total = Number(response.headers.get('Content-Length'));
-      if (total > limit) throw new Error('回听文件超过加载上限，请先拆分原音频。');
-      let loaded = 0;
-      const update = () => renderStatus({state:'loading',
-        progress:total > 0 ? Math.min(99, loaded / total * 100) : null,
-        message:`正在加载回听 · ${fileSize(loaded)}${total > 0 ? ' / ' + fileSize(total) + ' · ' + Math.min(99, Math.floor(loaded / total * 100)) + '%' : ''}`});
-      if (response.body) {
-        const reader = response.body.getReader();
-        while (true) {
-          const {done, value} = await reader.read();
-          if (done) break;
-          if (!current()) { await reader.cancel(); return; }
-          loaded += value.byteLength;
-          if (loaded > limit) { await reader.cancel(); throw new Error('回听文件超过加载上限，请先拆分原音频。'); }
-          chunks.push(value); update();
-        }
-      } else {
-        const value = await response.arrayBuffer(); loaded = value.byteLength;
-        if (loaded > limit) throw new Error('回听文件超过加载上限，请先拆分原音频。');
-        chunks.push(value);
-      }
-      if (!current()) return;
-      if (!loaded || (total > 0 && loaded !== total)) throw new Error('回听加载中断，请重试。');
-      if (playbackBlob) URL.revokeObjectURL(playbackBlob.url);
-      playbackBlob = {id:item.id, url:URL.createObjectURL(new Blob(chunks, {type:'audio/mpeg'}))};
-      fallbackLoading = false;
-      renderStatus({state:'ready', progress:100, stream_url:'/api/playback/' + item.id + '/audio'});
-    } catch (error) {
-      fallbackLoading = false;
-      if (current() && error.name !== 'AbortError') fail(error);
-    } finally {
-      chunks.length = 0;
-      if (playbackFetchController === controller) playbackFetchController = null;
-    }
+  const subscribe = () => {
+    playbackUnsubscribe?.();
+    try { playbackUnsubscribe = cache.watch(item, renderStatus); }
+    catch (error) { renderStatus({state:'error', message:error.message}); }
   };
-  const schedule = () => { if (current()) playbackPollTimer = setTimeout(poll, 1500); };
-  const poll = async () => {
-    if (!current()) return;
+  retry.addEventListener('click', async () => {
+    retry.disabled = true; playbackUnsubscribe?.();
     try {
-      const status = await api('/api/playback/' + item.id + '/status');
-      if (!current()) return;
-      state.playbacks.set(item.id, status);
-      if (status.state === 'idle') { prepare(); return; }
-      renderStatus(status);
-      if (!['ready','error'].includes(status.state)) schedule();
-    } catch (error) { if (current()) fail(error); }
-  };
-  const prepare = async () => {
-    clearTimeout(playbackPollTimer);
-    if (!current()) return;
-    renderStatus({state:'queued', message:'正在准备兼容回听…'});
-    try {
-      const status = await api('/api/playback/' + item.id + '/prepare', {method:'POST'});
-      if (!current()) return;
-      state.playbacks.set(item.id, status); renderStatus(status);
-      if (!['ready','error'].includes(status.state)) schedule();
-    } catch (error) { if (current()) fail(error); }
-  };
-  $('#playback-retry').addEventListener('click', () => {
-    playbackFetchController?.abort();
-    if (playbackBlob?.id === item.id) { URL.revokeObjectURL(playbackBlob.url); playbackBlob = null; }
-    fallbackAttempted = false; player.dataset.source = ''; prepare();
-  });
+      await cache.invalidate(item);
+      if (current()) { player.dataset.source = ''; subscribe(); }
+    } catch (error) { if (current()) renderStatus({state:'error', message:error.message || '请稍后重试回听。'}); }
+    finally { if (retry.isConnected) retry.disabled = false; }
+  }, {signal:playerEventController.signal});
   player.addEventListener('error', () => {
-    if (current()) {
-      if (fallbackLoading) return;
-      clearTimeout(playbackPollTimer); state.playbacks.delete(item.id);
-      if (!fallbackAttempted && player.dataset.source) { loadWithoutRanges(); return; }
-      renderStatus({state:'error', message:'兼容回听加载失败，请重试；原音频和评分已保留。'});
-    }
-  });
-  if (playbackBlob?.id === item.id) {
-    renderStatus({state:'ready', progress:100, stream_url:'/api/playback/' + item.id + '/audio'}); return;
-  }
-  const known = state.playbacks.get(item.id);
-  if (known?.state === 'ready') { renderStatus(known); poll(); }
-  else prepare();
+    if (current()) renderStatus({state:'error', message:'回听文件无法播放，请重试；原音频和评分已保留。'});
+  }, {signal:playerEventController.signal});
+  subscribe();
 }
 function setupPlayer(item) {
   const generation = ++playbackGeneration;
-  clearTimeout(playbackPollTimer);
-  playbackFetchController?.abort(); playbackFetchController = null;
-  if (playbackBlob && playbackBlob.id !== item.id) { URL.revokeObjectURL(playbackBlob.url); playbackBlob = null; }
+  playbackUnsubscribe?.(); playbackUnsubscribe = null;
+  playerEventController?.abort(); playerEventController = new AbortController();
   resizeObserver?.disconnect(); resizeObserver = null;
   const player = $('#audio-player'), canvas = $('#waveform');
-  if (!player || !canvas) return;
+  if (!player || !canvas) { window.audioPlaybackCache.setActive(null); return; }
+  window.audioPlaybackCache.setActive(window.audioPlaybackCache.keyFor(item));
+  const eventOptions = {signal:playerEventController.signal};
   const waveform = item.result?.metrics.waveform || [], knownDuration = item.result?.metrics.duration;
   const draw = () => {
     if (!canvas.isConnected) return;
@@ -320,19 +276,19 @@ function setupPlayer(item) {
     $('#play-time').textContent = formatTime(player.currentTime);
     $('#play-duration').textContent = formatTime(knownDuration || player.duration);
   };
-  player.addEventListener('timeupdate', draw);
-  player.addEventListener('loadedmetadata', draw);
-  $('#playback-speed').addEventListener('change', event => { player.playbackRate = Number(event.target.value); });
+  player.addEventListener('timeupdate', draw, eventOptions);
+  player.addEventListener('loadedmetadata', draw, eventOptions);
+  $('#playback-speed').addEventListener('change', event => { player.playbackRate = Number(event.target.value); }, eventOptions);
   canvas.addEventListener('click', event => {
     const duration = knownDuration || player.duration;
     if (!Number.isFinite(duration)) return;
     const rect = canvas.getBoundingClientRect(); player.currentTime = Math.max(0, Math.min(duration, (event.clientX - rect.left) / rect.width * duration));
     draw();
-  });
+  }, eventOptions);
   canvas.addEventListener('keydown', event => {
     if (['ArrowLeft','ArrowRight'].includes(event.key)) { event.preventDefault(); player.currentTime = Math.max(0, Math.min(player.duration || 0, player.currentTime + (event.key === 'ArrowRight' ? 5 : -5))); draw(); }
     if (event.key === ' ') { event.preventDefault(); player.paused ? player.play().catch(() => {}) : player.pause(); }
-  });
+  }, eventOptions);
   resizeObserver = new ResizeObserver(draw); resizeObserver.observe(canvas); draw();
   setupCompatiblePlayback(item, player, generation);
 }
@@ -354,7 +310,9 @@ function refresh(force = false) {
       return item;
     });
     state.queue = response.queue;
-    if (!state.selected && state.items.length) state.selected = state.items[0].id;
+    const validIds = new Set(state.items.map(item => item.id));
+    state.checked = new Set([...state.checked].filter(id => validIds.has(id)));
+    if (!validIds.has(state.selected)) { clearDetail(); state.selected = state.items[0]?.id || null; }
     const selected = selectedItem();
     if (selected?.result && eligible(selected) && !Array.isArray(selected.result.quality.windows)) {
       const item = await api('/api/reviews/' + selected.id);
@@ -516,65 +474,137 @@ function retryUploads() {
   updateImportDisplay(); processUploadQueue();
 }
 async function controlTasks(action, ids = taskItems(action).map(item => item.id)) {
-  if (!ids.length || state.taskControlLoading || !state.health?.task_pause) return;
+  if (!ids.length || state.taskControlLoading || state.deleteLoading || !state.health?.task_pause) return;
+  const scope = action === 'resume' && state.health?.resume_scope ? currentScope() : null;
   state.taskControlLoading = true; renderQueue();
   for (const name of ['pause','resume']) { const button = $('#' + name + '-selected'); if (button) button.disabled = true; }
   try {
-    let changed = 0, skipped = 0;
+    let changed = 0, skipped = 0, switched = 0;
     for (let index = 0; index < ids.length; index += 200) {
-      const response = await api('/api/tasks/' + action, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids.slice(index,index + 200)})});
+      const response = await api('/api/tasks/' + action, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids.slice(index,index + 200), ...(scope ? {scope} : {})})});
       changed += (response[action === 'pause' ? 'paused' : 'resumed'] || []).length;
       skipped += (response.skipped || []).length;
+      switched += (response.scope_changed || []).length;
       state.queue = response.queue;
     }
-    notify(changed ? (action === 'pause' ? `已请求暂停 ${changed} 条评测` : `已继续 ${changed} 条评测`) + (skipped ? `，${skipped} 条状态已变化` : '') : '任务状态已变化，正在刷新列表');
+    notify(changed ? (action === 'pause' ? `已请求暂停 ${changed} 条评测` : `已继续 ${changed} 条评测`) + (switched ? `，${switched} 条已切换为${scopeNames[scope]}，旧模式停止` : '') + (skipped ? `，${skipped} 条状态已变化` : '') : '任务状态已变化，正在刷新列表');
     await refresh(true);
   } catch (error) { notify(error.message); await refresh(true); }
   finally {
-    state.taskControlLoading = false; renderQueue();
+    state.taskControlLoading = false; renderQueue(); renderDetail();
     for (const name of ['pause','resume']) { const button = $('#' + name + '-selected'); if (button) button.disabled = !state.health?.task_pause; }
   }
 }
+async function deleteItems(ids) {
+  if (!ids.length || state.deleteLoading || state.taskControlLoading || state.loading || !state.health?.audio_delete) return;
+  const records = state.items.filter(item => ids.includes(item.id));
+  if (!records.length) return;
+  const title = records.length === 1 ? `删除「${displayName(records[0])}」？` : `删除所选 ${records.length} 条音频？`;
+  if (!window.confirm(title + '\n相关检测任务会停止，原音频、自动结果和人工评分会删除。此操作无法撤销。')) return;
+  state.deleteLoading = true; renderQueue();
+  const deleted = new Set(), cacheKeys = new Set();
+  let failure = null, pending = false, recoveredItems = null;
+  try {
+    for (let index = 0; index < records.length; index += 200) {
+      const response = await api('/api/reviews/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:records.slice(index,index + 200).map(item => item.id)})});
+      for (const id of response.deleted || []) deleted.add(id);
+      for (const key of response.cache_keys_removed || []) cacheKeys.add(key);
+      pending ||= Array.isArray(response.cleanup_pending) ? response.cleanup_pending.length > 0 : !!response.cleanup_pending;
+      state.queue = response.queue;
+    }
+  } catch (error) {
+    failure = error.message;
+    try {
+      const snapshot = await api('/api/reviews?compact=true');
+      const liveIds = new Set(snapshot.items.map(item => item.id)), liveDigests = new Set(snapshot.items.map(item => item.sha256));
+      for (const item of records) if (!liveIds.has(item.id)) {
+        deleted.add(item.id);
+        if (!liveDigests.has(item.sha256)) cacheKeys.add(window.audioPlaybackCache.keyFor(item));
+      }
+      recoveredItems = snapshot.items; state.queue = snapshot.queue;
+    } catch (_) { failure += '；暂时无法确认服务器状态，请稍后刷新。'; }
+  }
+  try {
+    if (deleted.size) {
+      ++refreshVersion;
+      if (deleted.has(state.selected)) { clearDetail(); state.selected = null; }
+      if (recoveredItems) {
+        const previous = new Map(state.items.map(item => [item.id,item]));
+        state.items = recoveredItems.map(item => {
+          const old = previous.get(item.id);
+          if (old?.updated_at === item.updated_at && Array.isArray(old.result?.quality.windows)) item.result = old.result;
+          return item;
+        });
+      } else state.items = state.items.filter(item => !deleted.has(item.id));
+      for (const id of deleted) { state.checked.delete(id); state.drafts.delete(id); playbackPositions.delete(id); }
+      if (!state.selected) state.selected = state.items[0]?.id || null;
+      await window.audioPlaybackCache.removeRecords(state.items, deleted, cacheKeys);
+      renderQueue(); renderDetail(true);
+    }
+    await refresh(true);
+    notify(`${deleted.size ? `已删除 ${deleted.size} 条音频${pending ? '，任务退出后会完成文件清理' : ''}` : '未删除音频'}${failure ? '；' + failure : ''}`);
+  } catch (error) { notify(`已删除 ${deleted.size} 条记录；${error.message || '正在刷新列表'}`); await refresh(true); }
+  finally { state.deleteLoading = false; renderQueue(); renderDetail(); }
+}
 async function runItems(ids, force = false) {
-  if (state.loading || !ids.length) return;
+  if (state.loading || state.deleteLoading || !ids.length) return;
+  const scope = currentScope();
   state.loading = true; renderQueue();
   try {
     const submitted = [], reused = [];
     for (let index = 0; index < ids.length; index += 200) {
-      const response = await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids.slice(index,index + 200), scope:$('#scope-select').value, force})});
+      const response = await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids.slice(index,index + 200), scope, force})});
       submitted.push(...response.submitted); reused.push(...response.reused);
       response.submitted.forEach(id => state.checked.delete(id));
     }
     notify(submitted.length ? `已提交 ${submitted.length} 条${reused.length ? '，其中 ' + reused.length + ' 条复用结果' : ''}` : '这些音频已经在检测队列中'); await refresh(true);
   } catch (error) { notify(error.message); }
-  finally { state.loading = false; renderQueue(); }
+  finally { state.loading = false; renderQueue(); renderDetail(); }
 }
 async function saveHumanReview(event) {
-  event.preventDefault(); const item = selectedItem(); if (!item) return;
+  event.preventDefault();
+  const id = event.target.dataset.audioId, item = state.items.find(row => row.id === id);
+  if (!item || id !== state.selected) { notify('音频已切换，请在当前音频的评分表中保存。'); return; }
   const form = new FormData(event.target), ratings = {};
   for (const [key] of ratingFields) { const value = form.get(key); if (value !== '') ratings[key] = value === 'na' ? null : Number(value); }
   const document = {ratings, ai_suspicion:form.get('ai_suspicion'), reviewer:form.get('reviewer'), notes:form.get('notes')};
-  $('#save-review').disabled = true;
+  const button = event.target.querySelector('#save-review'); button.disabled = true;
   try {
     const updated = await api('/api/reviews/' + item.id + '/human', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(document)});
     state.drafts.delete(item.id); event.target.dataset.dirty = 'false';
     state.items = state.items.map(row => row.id === updated.id ? updated : row); renderQueue(); renderDetail(true);
     notify(updated.review.complete ? '7 个维度的人工评分已保存' : '已保存当前评分，可以稍后补充');
-  } catch (error) { notify(error.message); $('#save-review').disabled = false; }
+  } catch (error) { notify(error.message); if (button.isConnected) button.disabled = false; }
 }
 $('#blind-toggle').checked = state.blind;
 $('#blind-toggle').addEventListener('change', event => { state.blind = event.target.checked; localStorage.setItem('audio-review-blind', String(state.blind)); renderQueue(); renderDetail(true); renderImports(); });
 $('#audio-list').addEventListener('click', event => {
+  const deletion = event.target.closest('[data-delete]');
+  if (deletion) { deleteItems([deletion.dataset.delete]); return; }
   const action = event.target.closest('[data-task-action]');
   if (action) { controlTasks(action.dataset.taskAction, [action.dataset.taskId]); return; }
   const button = event.target.closest('[data-select]');
-  if (button) { state.selected = button.dataset.select; renderQueue(); refresh(true); }
+  if (button) {
+    const id = button.dataset.select;
+    if (state.selected !== id) {
+      const previousId = $('#detail-panel').dataset.audioId, form = $('#review-form'), player = $('#audio-player');
+      if (previousId && form?.dataset.dirty === 'true') state.drafts.set(previousId, Object.fromEntries(new FormData(form)));
+      if (previousId && player && (player.readyState >= 1 || !playbackPositions.has(previousId))) playbackPositions.set(previousId, {time:player.currentTime, rate:player.playbackRate, paused:player.paused});
+      clearDetail(); state.selected = id; renderQueue(); renderDetail(true);
+    }
+    refresh(true);
+  }
 });
 $('#audio-list').addEventListener('change', event => { const input = event.target.closest('[data-check]'); if (input) { input.checked ? state.checked.add(input.dataset.check) : state.checked.delete(input.dataset.check); renderQueue(); } });
 $('#select-all').addEventListener('change', event => { state.items.forEach(item => event.target.checked ? state.checked.add(item.id) : state.checked.delete(item.id)); renderQueue(); });
 $('#select-pending').addEventListener('click', () => { state.checked = new Set(state.items.filter(item => ['uploaded','error'].includes(item.status)).map(item => item.id)); renderQueue(); });
 $('#clear-selection').addEventListener('click', () => { state.checked.clear(); renderQueue(); });
-$('#scope-select').addEventListener('change', () => { $('#scope-description').textContent = scopeDescriptions[$('#scope-select').value]; });
+const savedScope = localStorage.getItem('audio-review-scope');
+if (Object.hasOwn(scopeNames, savedScope)) { $('#scope-select').value = savedScope; $('#scope-description').textContent = scopeDescriptions[savedScope]; }
+$('#scope-select').addEventListener('change', () => {
+  localStorage.setItem('audio-review-scope', currentScope()); $('#scope-description').textContent = scopeDescriptions[currentScope()];
+  renderQueue(); if (['paused','pausing'].includes(selectedItem()?.status)) renderDetail(true);
+});
 $('#file-input').addEventListener('change', event => { const files = Array.from(event.target.files); event.target.value = ''; uploadFiles(files); });
 $('#dropzone').addEventListener('keydown', event => { if (['Enter',' '].includes(event.key)) { event.preventDefault(); $('#file-input').click(); } });
 $('#dropzone').addEventListener('dragover', event => { event.preventDefault(); $('#dropzone').classList.add('dragging'); });
@@ -585,6 +615,7 @@ $('#clear-upload-history').addEventListener('click', () => { if (!state.imports.
 $('#run-button').addEventListener('click', () => runItems(batchItems().map(item => item.id)));
 $('#pause-tasks').addEventListener('click', () => controlTasks('pause'));
 $('#resume-tasks').addEventListener('click', () => controlTasks('resume'));
+$('#delete-selected').addEventListener('click', () => deleteItems([...state.checked]));
 $('#refresh-button').addEventListener('click', () => refresh(true));
 $('#export-button').addEventListener('click', () => { const link = document.createElement('a'); link.href = '/api/export.csv?blind=' + state.blind; link.download = '音频评测评分表.csv'; document.body.appendChild(link); link.click(); link.remove(); });
 $('#detail-panel').addEventListener('click', event => {

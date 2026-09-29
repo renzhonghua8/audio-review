@@ -7,6 +7,7 @@
   <meta name="description" content="批量音频质检、问题片段回听与人工评分校准。">
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/playback-cache.js"></script>
   <script defer src="/static/app.js"></script>
 </head>
 <body>
@@ -40,10 +41,10 @@
         <div class="run-settings"><label for="scope-select">评测模式</label><select id="scope-select"><option value="fast">全量快速 · 推荐</option><option value="sample">快速抽样 · 开头与中段 2 分钟</option><option value="full">全量精细 · 1 秒滑窗</option></select><p id="scope-description">约 9 秒一个音质窗口，覆盖全段。基础声学检测始终覆盖全量。</p></div>
         <button class="button primary full" id="run-button" disabled><span class="play-small">▶</span> 批量检测 <span id="pending-count"></span></button>
         <div class="task-toolbar" aria-label="评测任务控制"><button type="button" class="button secondary" id="pause-tasks" disabled>暂停全部</button><button type="button" class="button secondary" id="resume-tasks" disabled>继续全部</button></div>
-        <p class="task-control-help">勾选可暂停或继续部分任务；未勾选时操作全部。暂停后保留进度。</p>
+        <p class="task-control-help" id="task-control-help">勾选可暂停或继续部分任务；未勾选时操作全部。继续时使用上方模式：模式相同保留进度，切换模式重新检测。</p>
         <p class="queue-status" id="queue-status" role="status">正在连接检测服务…</p>
         <div class="queue-heading"><span id="queue-label">音频列表</span><label class="switch-label"><input type="checkbox" id="blind-toggle"><span>盲听模式</span></label></div>
-        <div class="batch-toolbar"><label class="switch-label"><input type="checkbox" id="select-all"><span>全选</span></label><button type="button" class="batch-link" id="select-pending">选待检测</button><button type="button" class="batch-link" id="clear-selection">清除选择</button><span id="selection-count">未选择</span></div>
+        <div class="batch-toolbar"><label class="switch-label"><input type="checkbox" id="select-all"><span>全选</span></label><button type="button" class="batch-link" id="select-pending">选待检测</button><button type="button" class="batch-link" id="clear-selection">清除选择</button><button type="button" class="batch-link delete-action" id="delete-selected" disabled>删除所选</button><span id="selection-count">未选择</span></div>
         <div class="audio-list" id="audio-list"><div class="empty-queue"><span class="mini-wave">▂ ▆ █ ▄ ▂</span><p>导入音频后，在这里查看进度。</p></div></div>
         <div class="engine-note"><span class="engine-dot" id="engine-dot"></span><div><strong id="engine-title">正在检查本地音质模型</strong><p id="engine-description">音质检测与人工评分独立保存。</p></div></div>
       </section>

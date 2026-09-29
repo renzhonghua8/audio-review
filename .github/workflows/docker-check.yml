@@ -156,9 +156,22 @@ jobs:
           sudo -n python3 scripts/container-resource-check.py monitor "$report_dir" \
             --container audio-review-parallel-ci &
           monitor_pid=$!
+          (
+            while true; do
+              status="$(curl --silent --show-error --max-time 5 --output /dev/null \
+                --write-out '%{http_code}' http://127.0.0.1:9009/)" || status='error'
+              printf '%s HTTP %s\n' "$(date -u +%FT%TZ)" "$status" >> "$report_dir/busy-playback-existing-service.log"
+              if [[ "$status" != 200 ]]; then touch "$report_dir/busy-playback-existing-service-failed"; exit 1; fi
+              sleep 0.5
+            done
+          ) &
+          probe_pid=$!
           finish() {
             result=$?
             trap - EXIT
+            kill "$probe_pid" 2>/dev/null || true
+            wait "$probe_pid" || true
+            if [[ -e "$report_dir/busy-playback-existing-service-failed" ]]; then result=1; fi
             touch "$report_dir/stop-monitor"
             wait "$monitor_pid" || true
             docker logs --tail 200 audio-review-parallel-ci > "$report_dir/container.log" 2>&1 || true
@@ -176,6 +189,12 @@ jobs:
             -e TASK_CONTROL_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
             audio-review-parallel-ci python scripts/task-control-smoke-test.py \
             | tee "$report_dir/task-control.log"
+          docker exec -e RECORD_ACTIONS_TEST_DISPOSABLE=1 \
+            -e RECORD_ACTIONS_REPORT_DIR=/tmp/task-control-ci \
+            -e RECORD_ACTIONS_EXISTING_SERVICE_URL="http://$existing_ip:9009/" \
+            audio-review-parallel-ci python scripts/record-actions-smoke-test.py \
+            | tee "$report_dir/record-actions.log"
+          test ! -e "$report_dir/busy-playback-existing-service-failed"
           touch "$report_dir/stop-monitor"
           wait "$monitor_pid"
           python3 scripts/container-resource-check.py verify "$report_dir" | tee "$report_dir/resources.log"

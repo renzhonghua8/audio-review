@@ -24,7 +24,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from evaluator import EvaluationPaused, Evaluator, EVALUATOR_VERSION, MODEL_SHA256, SCOPE_LABELS, install_model, read_checkpoint
-from playback import PlaybackCache, PlaybackError, stream_audio
+from playback import CACHE_VERSION, PlaybackCache, PlaybackError, stream_audio
 from media import validate_audio
 
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +63,10 @@ WORKERS = bounded_setting('AUDIO_REVIEW_WORKERS', min(2, os.cpu_count() or 1))
 MODEL_THREADS = bounded_setting('AUDIO_REVIEW_MODEL_THREADS', 2)
 executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix='audio-review')
 jobs = {}
+retired_jobs = {}
+pending_cleanup = {}
+cleanup_wake = threading.Event()
+cleanup_stopped = threading.Event()
 stopping = threading.Event()
 evaluator = Evaluator(MODELS / 'sig_bak_ovr.onnx', threads=MODEL_THREADS)
 MAX_FILE_BYTES = 200 * 1024 * 1024
@@ -126,7 +130,7 @@ async def local_origin(request: Request, call_next):
     response = await call_next(request)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Referrer-Policy'] = 'no-referrer'
-    response.headers['Cache-Control'] = 'no-store'
+    response.headers.setdefault('Cache-Control', 'no-store')
     return response
 
 
@@ -189,7 +193,8 @@ def cached_result(row, scope):
     for candidate in candidates:
         result = json.loads(candidate['result_json'])
         if (result.get('evaluator_version') == EVALUATOR_VERSION and
-                result.get('quality', {}).get('model_sha256') == MODEL_SHA256):
+                result.get('quality', {}).get('model_sha256') == MODEL_SHA256 and
+                result.get('quality', {}).get('scope') == scope):
             return reused_result(result)
     return None
 
@@ -264,51 +269,188 @@ def create_job(row, scope, force, *, restore=False):
     return job
 
 
+def retire_job(key, job):
+    if jobs.get(key) is job:
+        jobs.pop(key)
+    if job['scheduled']:
+        retired_jobs[id(job)] = job
+
+
+def detach_row(row):
+    """Remove one consumer; an exiting worker keeps its reserved slot."""
+    key = job_key(row)
+    job = jobs.get(key)
+    if job is None or row['id'] not in job['ids']:
+        return
+    job['ids'].remove(row['id'])
+    job['paused_ids'].discard(row['id'])
+    job['force_by_id'].pop(row['id'], None)
+    if job['ids']:
+        # A scheduled worker may already have opened the old source. Keep its
+        # worker_source reference until finally, while future runs use a survivor.
+        if job['source'] == UPLOADS / row['stored_name']:
+            survivor = get_row(job['ids'][0])
+            job['source'] = UPLOADS / survivor['stored_name']
+        if not active_ids(job):
+            job['pause_event'].set()
+    else:
+        job['pause_event'].set()
+        retire_job(key, job)
+        queue_session_cleanup(job['session_id'])
+
+
+def safe_original_path(stored_name):
+    if not re.fullmatch(r'[a-f0-9]{32}\.[a-z0-9]{1,16}', stored_name):
+        raise HTTPException(409, '原音频文件路径无效，已停止删除，请检查本地数据。')
+    path = UPLOADS / stored_name
+    if path.is_symlink() or path.resolve().parent != UPLOADS.resolve() or path.is_dir():
+        raise HTTPException(409, '原音频文件是链接或路径无效，已停止删除。')
+    return path
+
+
+def queue_file_cleanup(kind, name, identifier=None):
+    pending_cleanup[(kind, name)] = {'kind': kind, 'name': name, 'id': identifier,
+                                     'message': '文件仍在使用，稍后自动清理。'}
+    cleanup_wake.set()
+
+
+def queue_session_cleanup(session_id):
+    if re.fullmatch(r'[a-f0-9]{32}', session_id):
+        queue_file_cleanup('checkpoint', session_id)
+
+
+def cleanup_owned_files():
+    """Retry only named application files; never remove unrelated directories."""
+    with db_lock:
+        tracked = [*jobs.values(), *retired_jobs.values()]
+        with connect() as database:
+            rows = database.execute('SELECT stored_name,sha256,task_json FROM reviews').fetchall()
+        names = {row['stored_name'] for row in rows}
+        digests = {row['sha256'] for row in rows}
+        sessions = {task_document(row).get('session_id') for row in rows}
+        for token, entry in list(pending_cleanup.items()):
+            kind, name = token
+            try:
+                if kind == 'original':
+                    if name in names:
+                        pending_cleanup.pop(token, None)
+                        continue
+                    path = safe_original_path(name)
+                    if (any(job['scheduled'] and path in {job['source'], job.get('worker_source')}
+                            for job in tracked) or playback.references_source(path)):
+                        continue
+                    path.unlink(missing_ok=True)
+                elif kind == 'checkpoint':
+                    if name in sessions or any(job['session_id'] == name and job['ids'] for job in tracked):
+                        pending_cleanup.pop(token, None)
+                        continue
+                    if any(job['session_id'] == name and job['scheduled'] for job in tracked):
+                        continue
+                    folder = TEMP / name
+                    if folder.is_symlink() or folder.resolve().parent != TEMP.resolve():
+                        raise RuntimeError('检查点路径无效，无法自动清理。')
+                    for filename in ('decoded-original.wav', 'decoded-16k.wav', 'checkpoint.json', 'checkpoint.part.json'):
+                        (folder / filename).unlink(missing_ok=True)
+                    if folder.exists():
+                        folder.rmdir()
+                elif kind == 'playback':
+                    if name in digests:
+                        pending_cleanup.pop(token, None)
+                        continue
+                    playback.remove(name)
+                pending_cleanup.pop(token, None)
+            except (OSError, RuntimeError, HTTPException, PlaybackError):
+                entry['message'] = '文件清理尚未完成，系统会继续重试；请检查文件权限和磁盘状态。'
+
+
+def collect_orphan_files():
+    # Crash/restart recovery for safe application filenames whose DB rows were
+    # already deleted. Preserve every upload and checkpoint still referenced.
+    with db_lock, connect() as database:
+        rows = database.execute('SELECT stored_name,sha256,task_json FROM reviews').fetchall()
+        names = {row['stored_name'] for row in rows}
+        sessions = {task_document(row).get('session_id') for row in rows}
+        digests = {row['sha256'] for row in rows}
+        for path in UPLOADS.iterdir():
+            if re.fullmatch(r'[a-f0-9]{32}\.[a-z0-9]{1,16}', path.name) and path.name not in names:
+                queue_file_cleanup('original', path.name)
+        for folder in TEMP.iterdir():
+            if re.fullmatch(r'[a-f0-9]{32}', folder.name) and folder.name not in sessions:
+                queue_session_cleanup(folder.name)
+        for path in playback.folder.glob(f'*.{CACHE_VERSION}.mp3'):
+            digest = path.name.removesuffix(f'.{CACHE_VERSION}.mp3')
+            if re.fullmatch(r'[a-f0-9]{64}', digest) and digest not in digests:
+                queue_file_cleanup('playback', digest)
+
+
+def cleanup_loop():
+    while not cleanup_stopped.is_set():
+        cleanup_wake.wait(timeout=5)
+        cleanup_wake.clear()
+        if cleanup_stopped.is_set():
+            return
+        cleanup_owned_files()
+
+
 def schedule_jobs():
     # This is called under db_lock. At most WORKERS futures exist; paused jobs
     # remain plain metadata and never occupy executor threads or child processes.
     if stopping.is_set():
         return
-    reserved = sum(job['scheduled'] for job in jobs.values())
+    reserved = sum(job['scheduled'] for job in [*jobs.values(), *retired_jobs.values()])
     for key, job in jobs.items():
         if reserved >= WORKERS:
             break
         if not job['scheduled'] and active_ids(job):
             job['scheduled'] = True
             job['pause_event'].clear()
-            executor.submit(run_job, key)
+            executor.submit(run_job, key, job)
             reserved += 1
 
 
-def job_progress(key, percent, stage, info=None):
+def job_progress(key, percent, stage, info=None, *, expected_job=None):
     with db_lock:
-        job = jobs[key]
+        job = expected_job or jobs.get(key)
+        if job is None or jobs.get(key) is not job:
+            return
         job.update(progress=max(job['progress'], percent), stage=stage)
         if info:
             job['info'].update(info)
         update_task_rows(job, active_ids(job), progress=job['progress'], stage=stage)
 
 
-def job_checkpoint(key):
-    if stopping.is_set() or jobs[key]['pause_event'].is_set():
+def job_checkpoint(key, expected_job=None):
+    job = expected_job or jobs.get(key)
+    if (stopping.is_set() or job is None or jobs.get(key) is not job or job['pause_event'].is_set()):
         raise EvaluationPaused()
 
 
-def run_job(key):
+def run_job(key, expected_job=None):
     with db_lock:
-        job = jobs[key]
+        job = expected_job or jobs.get(key)
+        if job is None:
+            return
         if not active_ids(job) or stopping.is_set():
             job['scheduled'] = False
+            retired_jobs.pop(id(job), None)
+            if jobs.get(key) is job and not job['ids']:
+                jobs.pop(key)
+            queue_session_cleanup(job['session_id'])
+            cleanup_owned_files()
             schedule_jobs()
             return
         job['started'] = True
+        job['worker_source'] = job['source']
+        source = job['worker_source']
         update_task_rows(job, active_ids(job), status='processing', stage=job['stage'],
                          progress=job['progress'], error=None)
     try:
-        result = evaluator.evaluate(job['source'], TEMP / job['session_id'], key[1],
-                                    lambda percent, stage, info=None: job_progress(key, percent, stage, info),
-                                    checkpoint=lambda: job_checkpoint(key), source_identity=key[0])
+        result = evaluator.evaluate(source, TEMP / job['session_id'], key[1],
+                                    lambda percent, stage, info=None: job_progress(key, percent, stage, info, expected_job=job),
+                                    checkpoint=lambda: job_checkpoint(key, job), source_identity=key[0])
         with db_lock:
+            if jobs.get(key) is not job:
+                return
             for index, identifier in enumerate(active_ids(job)):
                 shared = reused_result(result) if index else result
                 update(identifier, status='done', progress=100,
@@ -323,9 +465,12 @@ def run_job(key):
                     task.update(task_info(job, identifier))
                 update(identifier, status='paused', stage='已暂停 · 可继续检测' if row['status'] == 'pausing' else row['stage'],
                        task_json=json.dumps(task), resume_result_json=json.dumps(reused_result(result), ensure_ascii=False))
-            jobs.pop(key, None)
+            retire_job(key, job)
+            queue_session_cleanup(job['session_id'])
     except EvaluationPaused as error:
         with db_lock:
+            if jobs.get(key) is not job:
+                return
             if error.info:
                 job['info'].update(error.info)
             if error.progress is not None:
@@ -342,23 +487,39 @@ def run_job(key):
     except Exception as error:
         message = str(error) if isinstance(error, RuntimeError) else '检测未完成，请确认文件有效后重试。'
         with db_lock:
+            if jobs.get(key) is not job:
+                return
             update_many(active_ids(job), status='error', stage='检测失败', progress=0,
                         error=message, task_json='{}', resume_result_json=None)
             for identifier in job['paused_ids']:
                 task = task_document(get_row(identifier))
                 task['restart_required'] = True
                 update(identifier, status='paused', stage='已暂停 · 继续时重新检测', task_json=json.dumps(task), resume_result_json=None)
-            jobs.pop(key, None)
+            retire_job(key, job)
+            queue_session_cleanup(job['session_id'])
     finally:
         with db_lock:
+            job.update(started=False, scheduled=False, worker_source=None)
+            retired_jobs.pop(id(job), None)
             if jobs.get(key) is job:
-                jobs[key].update(started=False, scheduled=False)
+                if not job['ids']:
+                    jobs.pop(key)
+                    queue_session_cleanup(job['session_id'])
+            elif not job['ids']:
+                queue_session_cleanup(job['session_id'])
+            cleanup_owned_files()
             schedule_jobs()
 
 
 def stop_tasks():
     stopping.set()
     executor.shutdown(wait=True, cancel_futures=True)
+    with db_lock:
+        cleanup_owned_files()
+    cleanup_stopped.set()
+    cleanup_wake.set()
+    if cleanup_thread.is_alive():
+        cleanup_thread.join(timeout=5)
 
 
 def queue_status():
@@ -372,9 +533,10 @@ def queue_status():
                 pausing_sessions.add(session_id)
             else:
                 paused_sessions.add(session_id)
-        running_sessions = {job['session_id'] for job in jobs.values() if job['scheduled']}
+        tracked_jobs = [*jobs.values(), *retired_jobs.values()]
+        running_sessions = {job['session_id'] for job in tracked_jobs if job['scheduled']}
         paused_sessions.difference_update(running_sessions)
-        return {'workers': WORKERS, 'active_jobs': sum(job['started'] for job in jobs.values()),
+        return {'workers': WORKERS, 'active_jobs': sum(job['started'] for job in tracked_jobs),
                 'queued_jobs': sum(not job['started'] and bool(active_ids(job)) for job in jobs.values()),
                 'paused_jobs': len(paused_sessions), 'pausing_jobs': len(pausing_sessions),
                 'paused_files': sum(row['status'] == 'paused' for row in rows),
@@ -386,7 +548,11 @@ def evaluation_busy():
     return bool(queue['active_jobs'] or queue['queued_jobs'])
 
 
-playback = PlaybackCache(DATA / 'playback', UPLOADS, evaluation_busy)
+playback = PlaybackCache(DATA / 'playback', UPLOADS)
+collect_orphan_files()
+cleanup_owned_files()
+cleanup_thread = threading.Thread(target=cleanup_loop, name='audio-file-cleanup', daemon=True)
+cleanup_thread.start()
 
 
 @app.get('/')
@@ -399,7 +565,8 @@ def health():
     return {'ready': evaluator.ready, 'model': 'DNSMOS P.835 · regular', 'model_sha256': MODEL_SHA256,
             'subjective_model': None, 'local_only': IS_LOCAL, 'max_file_mb': 200, 'max_batch_files': 20,
             'max_run_files': 200, 'workers': WORKERS, 'model_threads': MODEL_THREADS,
-            'evaluator_version': EVALUATOR_VERSION, 'scopes': SCOPE_LABELS, 'task_pause': True}
+            'evaluator_version': EVALUATOR_VERSION, 'scopes': SCOPE_LABELS, 'task_pause': True,
+            'resume_scope': True, 'audio_delete': True}
 
 
 @app.get('/api/reviews')
@@ -470,9 +637,9 @@ class RunRequest(BaseModel):
 def run(request: RunRequest):
     if not evaluator.ready:
         raise HTTPException(503, '本地音质模型未就绪，请先运行模型安装。')
-    rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
     submitted, reused, skipped = [], [], []
     with db_lock:
+        rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
         for row in rows:
             fresh = get_row(row['id'])
             if fresh['status'] in {'queued', 'processing', 'paused', 'pausing'}:
@@ -504,12 +671,30 @@ class TaskRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=200)
 
 
+class ResumeRequest(TaskRequest):
+    scope: Literal['fast', 'sample', 'full'] | None = None
+
+
+def saved_resume_result(row, scope):
+    if scope != row['scope'] or not row['resume_result_json']:
+        return None
+    try:
+        result = json.loads(row['resume_result_json'])
+    except (ValueError, TypeError):
+        return None
+    quality = result.get('quality') if isinstance(result, dict) else None
+    if (not isinstance(quality, dict) or result.get('evaluator_version') != EVALUATOR_VERSION or
+            quality.get('model_sha256') != MODEL_SHA256 or quality.get('scope') != scope):
+        return None
+    return result
+
+
 @app.post('/api/tasks/pause')
 def pause_tasks(request: TaskRequest):
     # Validate every ID before changing any task, including IDs near the end.
-    rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
     paused, skipped = [], []
     with db_lock:
+        rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
         for original in rows:
             row = get_row(original['id'])
             if row['status'] not in {'queued', 'processing'}:
@@ -530,12 +715,16 @@ def pause_tasks(request: TaskRequest):
 
 
 @app.post('/api/tasks/resume')
-def resume_tasks(request: TaskRequest):
-    rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
-    if not evaluator.ready and any(row['status'] in {'paused', 'pausing'} and not row['resume_result_json'] for row in rows):
-        raise HTTPException(503, '本地音质模型未就绪，请先运行模型安装。')
-    resumed, skipped = [], []
+def resume_tasks(request: ResumeRequest):
+    requested_scope = getattr(request, 'scope', None)
+    resumed, skipped, scope_changed = [], [], []
     with db_lock:
+        rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
+        # Validate model availability for the entire batch before detaching rows.
+        if not evaluator.ready and any(row['status'] in {'paused', 'pausing'} and
+                saved_resume_result(row, requested_scope or row['scope']) is None
+                for row in rows):
+            raise HTTPException(503, '本地音质模型未就绪，请先运行模型安装。')
         for original in rows:
             row = get_row(original['id'])
             if row['status'] not in {'paused', 'pausing'}:
@@ -543,31 +732,82 @@ def resume_tasks(request: TaskRequest):
                 continue
             task = task_document(row)
             force = bool(task.get('force'))
-            result = json.loads(row['resume_result_json']) if row['resume_result_json'] else None
-            if result and (result.get('evaluator_version') != EVALUATOR_VERSION or
-                           result.get('quality', {}).get('model_sha256') != MODEL_SHA256):
-                result = None
-            key = job_key(row)
+            scope = requested_scope or row['scope']
+            changed = scope != row['scope']
+            if changed:
+                detach_row(row)
+                queue_session_cleanup(task.get('session_id', ''))
+                scope_changed.append(row['id'])
+            result = saved_resume_result(row, scope)
+            key = job_key(row, scope)
             job = jobs.get(key)
             if result is None and job is None and not force:
-                result = cached_result(row, row['scope'])
+                result = cached_result(row, scope)
             if result:
                 update(row['id'], status='done', progress=100, stage='检测完成 · 复用相同音频', error=None,
-                       result_json=json.dumps(reused_result(result), ensure_ascii=False), task_json='{}', resume_result_json=None)
+                       scope=scope, result_json=json.dumps(reused_result(result), ensure_ascii=False), task_json='{}', resume_result_json=None)
             else:
                 if job is None:
-                    job = jobs[key] = create_job(row, row['scope'], force, restore=True)
+                    # New scope starts from scratch. It may join an existing job
+                    # of exactly that scope, but cannot restore the old session.
+                    job = jobs[key] = (new_job(row, scope, force) if changed else create_job(row, scope, force, restore=True))
                 if row['id'] not in job['ids']:
                     job['ids'].append(row['id'])
                 job['paused_ids'].discard(row['id'])
                 job['force_by_id'][row['id']] = force
                 job['pause_event'].clear()
                 update_task_rows(job, [row['id']], status='processing' if job['started'] else 'queued',
-                                 progress=job['progress'], stage=job['stage'] if job['started'] else '等待继续检测',
+                                 scope=scope, progress=job['progress'], stage=job['stage'] if job['started'] else
+                                 '评测方式已更改 · 等待重新检测' if changed else '等待继续检测',
                                  error=None, resume_result_json=None)
             resumed.append(row['id'])
+        cleanup_owned_files()
         schedule_jobs()
-    return {'resumed': resumed, 'skipped': skipped, 'queue': queue_status()}
+    return {'resumed': resumed, 'skipped': skipped, 'scope_changed': scope_changed, 'queue': queue_status()}
+
+
+def delete_reviews(request: TaskRequest):
+    deleted, cache_keys_removed, retained_digests = [], [], []
+    cleanup_tokens = set()
+    with db_lock:
+        # Unknown IDs or unsafe source paths reject the whole batch before writes.
+        rows = [get_row(identifier) for identifier in dict.fromkeys(request.ids)]
+        for row in rows:
+            safe_original_path(row['stored_name'])
+            playback.cache_key(row['sha256'])
+        for row in rows:
+            detach_row(row)
+            session_id = task_document(row).get('session_id', '')
+            queue_session_cleanup(session_id)
+            cleanup_tokens.add(('checkpoint', session_id))
+            queue_file_cleanup('original', row['stored_name'], row['id'])
+            cleanup_tokens.add(('original', row['stored_name']))
+        with connect() as database:
+            database.executemany('DELETE FROM reviews WHERE id=?', [(row['id'],) for row in rows])
+            remaining = {row['sha256'] for row in database.execute('SELECT DISTINCT sha256 FROM reviews')}
+        for digest in dict.fromkeys(row['sha256'] for row in rows):
+            if digest in remaining:
+                retained_digests.append(digest)
+            else:
+                cache_keys_removed.append(playback.cache_key(digest))
+                queue_file_cleanup('playback', digest)
+                cleanup_tokens.add(('playback', digest))
+        cleanup_owned_files()
+        schedule_jobs()
+        deleted = [row['id'] for row in rows]
+        cleanup = [dict(entry) for token, entry in pending_cleanup.items() if token in cleanup_tokens]
+    return {'deleted': deleted, 'cache_keys_removed': cache_keys_removed,
+            'retained_digests': retained_digests, 'cleanup_pending': cleanup, 'queue': queue_status()}
+
+
+@app.delete('/api/reviews/{identifier}')
+def delete_review(identifier: str):
+    return delete_reviews(TaskRequest(ids=[identifier]))
+
+
+@app.post('/api/reviews/delete')
+def delete_review_batch(request: TaskRequest):
+    return delete_reviews(request)
 
 
 class HumanReview(BaseModel):
@@ -605,21 +845,23 @@ def audio(identifier: str, request: Request):
 
 def playback_status(row):
     status = playback.status(row['sha256'])
-    status['stream_url'] = f"/api/playback/{row['id']}/audio" if status['state'] == 'ready' else None
+    status['stream_url'] = f"/api/playback/{row['id']}/audio?key={status['cache_key']}" if status['state'] == 'ready' else None
     return status
 
 
 @app.post('/api/playback/{identifier}/prepare')
 def prepare_playback(identifier: str):
-    row = get_row(identifier)
-    result = json.loads(row['result_json']) if row['result_json'] else {}
-    duration = result.get('metrics', {}).get('duration')
-    try:
-        playback.prepare(UPLOADS / row['stored_name'], row['sha256'], duration)
-    except PlaybackError as error:
-        return JSONResponse({'state': 'error', 'progress': None, 'message': str(error),
-                             'prepared_seconds': 0, 'format': 'mp3', 'stream_url': None}, status_code=409)
-    return playback_status(row)
+    with db_lock:
+        row = get_row(identifier)
+        result = json.loads(row['result_json']) if row['result_json'] else {}
+        duration = result.get('metrics', {}).get('duration')
+        try:
+            playback.prepare(UPLOADS / row['stored_name'], row['sha256'], duration)
+        except PlaybackError as error:
+            return JSONResponse({'state': 'error', 'progress': None, 'message': str(error),
+                                 'prepared_seconds': 0, 'format': 'mp3', 'stream_url': None,
+                                 'cache_key': playback.cache_key(row['sha256']), 'bytes': None}, status_code=409)
+        return playback_status(row)
 
 
 @app.get('/api/playback/{identifier}/status')
@@ -628,8 +870,10 @@ def get_playback_status(identifier: str):
 
 
 @app.api_route('/api/playback/{identifier}/audio', methods=['GET', 'HEAD'])
-def compatible_audio(identifier: str, request: Request):
+def compatible_audio(identifier: str, request: Request, key: str | None = None):
     row = get_row(identifier)
+    if key is not None and key != playback.cache_key(row['sha256']):
+        raise HTTPException(404, '回听缓存标识不匹配，请刷新后重试。')
     return playback.audio_response(row['sha256'], request, filename=f"{row['id']}.mp3")
 
 

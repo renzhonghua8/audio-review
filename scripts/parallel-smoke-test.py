@@ -4,6 +4,7 @@ from __future__ import annotations
 import array
 import hashlib
 import http.client
+import importlib.util
 import json
 import math
 import os
@@ -19,6 +20,11 @@ import wave
 BASE = os.environ.get('SMOKE_BASE_URL', 'http://127.0.0.1:8001').rstrip('/')
 CLIENT = build_opener(ProxyHandler({}))
 MODEL_SHA256 = '269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd'
+playback_spec = importlib.util.spec_from_file_location(
+    'busy_playback_helpers', Path(__file__).with_name('playback-smoke-helpers.py'))
+playback_helpers = importlib.util.module_from_spec(playback_spec)
+playback_spec.loader.exec_module(playback_helpers)
+PlaybackVerification = playback_helpers.PlaybackVerification
 
 
 def api(path, body=None, method=None):
@@ -128,18 +134,32 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='audio-review-parallel-fixtures-') as temporary:
             folder = Path(temporary)
-            paths = [folder / name for name in ('long-a.wav', 'long-b.wav', 'short-c.wav')]
-            for path, seconds, frequency in zip(paths, (600, 600, 30), (440, 790, 1130)):
+            paths = [folder / name for name in ('long-a.wav', 'long-b.wav', 'short-c.wav', 'listen-d.wav')]
+            for path, seconds, frequency in zip(paths, (600, 600, 30, 180), (440, 790, 1130, 1391)):
                 fixture(path, seconds, frequency)
             rows = upload(paths)
-            ids = [row['id'] for row in rows]
-            assert len({row['sha256'] for row in rows}) == 3, rows
+            ids = [row['id'] for row in rows[:3]]
+            listen_id = rows[3]['id']
+            assert len({row['sha256'] for row in rows}) == 4, rows
             # SHA validation is streaming too; no fixture is read wholly into memory.
             for path, row in zip(paths, rows):
                 with path.open('rb') as source:
                     assert hashlib.file_digest(source, 'sha256').hexdigest() == row['sha256']
             api('/api/reviews/' + ids[0] + '/human',
                 {'ratings': {'clarity': 4}, 'reviewer': 'isolated concurrency test'}, 'PUT')
+            api('/api/reviews/' + listen_id + '/human',
+                {'ratings': {'clarity': 3}, 'reviewer': 'independent listening test'}, 'PUT')
+            api('/api/run', {'ids': [listen_id], 'scope': 'fast', 'force': True})
+            end = time.monotonic() + 60
+            while time.monotonic() < end:
+                listening = api('/api/reviews/' + listen_id)
+                assert listening['status'] != 'error', listening
+                if listening['status'] == 'done':
+                    check_result(listening, 180, 20)
+                    break
+                time.sleep(.1)
+            else:
+                raise AssertionError('Initial listening sample did not finish')
 
             for round_number, targets in enumerate((ids, ids[:2]), 1):
                 started = time.monotonic()
@@ -168,6 +188,14 @@ def main():
                             observation['third_queued_observed'] = True
                         if all(row['progress'] >= 35 for row in pair):
                             observation['both_scoring_observed'] = True
+                        if (round_number == 1 and not report.get('busy_playback')
+                                and current[ids[2]]['status'] == 'queued'
+                                and all(row['task']['scored_windows'] >= 3 for row in pair)):
+                            playback_check = PlaybackVerification(
+                                api, CLIENT, BASE, Path(report_dir) / 'parallel-playback' if report_dir else None)
+                            report['busy_playback'] = playback_check.exercise(listen_id, ids[:2], ids[2])
+                            check_existing()
+                            save_report()
                     for row in pair:
                         if row['status'] == 'processing':
                             values = observation['progress_values'][row['id']]
@@ -194,6 +222,7 @@ def main():
                            for values in observation['progress_values'].values()), observation
                 if round_number == 1:
                     assert observation['third_queued_observed'], observation
+                    assert report['busy_playback']['passed'], report
                 completed = [api('/api/reviews/' + identifier) for identifier in targets]
                 for index, row in enumerate(completed):
                     check_result(row, 600 if index < 2 else 30, 67 if index < 2 else 4)
@@ -209,7 +238,7 @@ def main():
                 print(json.dumps({key: value for key, value in observation.items() if key != 'trace'}), flush=True)
             report['passed'] = True
             save_report()
-            print('PASS: two distinct real model jobs overlap and progress; a third waits; forced reruns preserve independent human review.')
+            print('PASS: two distinct real model jobs overlap and progress; a third waits; compatible playback completes while scoring remains busy; forced reruns preserve independent human review.')
             print(report['note'])
     except Exception as error:
         report['error'] = str(error)

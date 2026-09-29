@@ -152,17 +152,23 @@ def exercise(test, health):
 
     with tempfile.TemporaryDirectory(prefix='audio-task-control-fixtures-') as temporary:
         folder = Path(temporary)
-        a, b, queued, probe = [folder / name for name in ('long-a.wav', 'long-b.wav', 'queued.wav', 'probe.wav')]
+        a, b, queued, probe, listen = [folder / name for name in
+                                     ('long-a.wav', 'long-b.wav', 'queued.wav', 'probe.wav', 'listen.wav')]
         for path, seconds, frequency in ((a, LONG_SECONDS, 440), (b, LONG_SECONDS, 790),
-                                         (queued, 12, 1130), (probe, 12, 1370)):
+                                         (queued, 12, 1130), (probe, 12, 1370), (listen, 180, 1511)):
             fixture(path, seconds, frequency)
-        imported = upload([a, b, queued, probe, a])
-    a, b, queued, probe, alias = [row['id'] for row in imported]
+        imported = upload([a, b, queued, probe, a, listen])
+    a, b, queued, probe, alias, listen = [row['id'] for row in imported]
     test.check(imported[0]['sha256'] == imported[4]['sha256']
                and len({row['sha256'] for row in imported[:4]}) == 4,
                'Fixtures include distinct jobs and two separate identical-content records')
     api('/api/reviews/' + a + '/human', {'ratings': {'clarity': 4}, 'reviewer': 'pause original'}, 'PUT')
     api('/api/reviews/' + alias + '/human', {'ratings': {'clarity': 2}, 'reviewer': 'pause duplicate'}, 'PUT')
+    api('/api/reviews/' + listen + '/human',
+        {'ratings': {'clarity': 3}, 'reviewer': 'independent listening test'}, 'PUT')
+    api('/api/run', {'ids': [listen], 'scope': 'fast', 'force': True})
+    test.wait([listen], lambda rows, queue: rows[listen]['status'] == 'done',
+              'An independent listening sample completes before the busy queue starts')
     blockers = [a, b][:health['workers']]
     submitted = api('/api/run', {'ids': blockers + [queued], 'scope': 'full', 'force': True})
     test.check(submitted['submitted'] == blockers + [queued], 'Long jobs fill the configured slots and a third waits')
@@ -170,6 +176,13 @@ def exercise(test, health):
                            all(rows[identifier]['status'] == 'processing'
                                and rows[identifier]['task']['processed_windows'] >= 5 for identifier in blockers)
                            and rows[queued]['status'] == 'queued', 'Model windows plus a queued file')
+    if health['workers'] == 2:
+        playback_check = helpers.PlaybackVerification(
+            api, helpers.CLIENT, helpers.BASE, test.folder,
+            local_data=os.environ.get('AUDIO_REVIEW_DATA_DIR', '/data'))
+        playback_report = playback_check.exercise(listen, blockers, queued)
+        test.check(playback_report['passed'],
+                   'A completed recording prepares, downloads and decodes while two model jobs and the queue remain busy')
     test.rejected('/api/tasks/pause', {'ids': [queued, 'missing-' + uuid.uuid4().hex]}, 404)
     test.check(api('/api/reviews/' + queued)['status'] == 'queued',
                'An unknown ID rejects the complete pause batch before changing a valid queued file')
@@ -279,6 +292,13 @@ def verify_restart(test, health):
     test.report = previous
     test.report['passed'] = False
     test.report['snapshots'] = []
+    if health['workers'] == 2:
+        playback_check = helpers.PlaybackVerification(
+            api, helpers.CLIENT, helpers.BASE, test.folder,
+            local_data=os.environ.get('AUDIO_REVIEW_DATA_DIR', '/data'))
+        playback_report = playback_check.verify_restart()
+        test.check(playback_report['passed'] and not playback_report['restart_verification_pending'],
+                   'Compatible playback survives restart and repeats without another conversion')
     row = api('/api/reviews/' + identifier)
     test.check(row['status'] == 'paused' and row['progress'] == state['row']['progress']
                and row['task'] == state['task'] and row['review'] == state['row']['review'],
